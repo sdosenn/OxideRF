@@ -1,0 +1,53 @@
+# Build output, local tools and test scripts (build/tools, build/test)
+/target/
+/build/
+/dist/
+
+# Captures, test runs and benchmark results
+/test-results/
+
+# Historical Python prototype: upstream copy, environment, bridge and tests.
+# Not used by the native application.
+/.venv/
+/vendor/
+/bridge/
+/tests/
+/scripts/benchmark.py
+/scripts/synthetic_pal.py
+__pycache__/
+.pytest_cache/
+/.cache/
+
+# RF captures, decoder output and media that must never be committed
+*.tbc
+*.tbc.json
+*.db
+*.log
+*.u8
+*.u16
+*.r8
+*.r16
+*.s8
+*.s16
+*.ldf
+*.lds
+*.r30
+*.raw
+*.flac
+*.wav
+*.mkv
+*.mov
+*.mp4
+*.y4m
+*.gray
+*.partial
+*.AppImage
+*.sup
+
+# Editors and desktop files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+.directory

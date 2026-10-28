@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+appdir="${APPDIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}"
+export LD_LIBRARY_PATH="$appdir/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# Enable Mesa's OpenCL implementation on the target AMD GPU when installed.
+export RUSTICL_ENABLE="${RUSTICL_ENABLE:-radeonsi}"
+exec "$appdir/usr/bin/oxide-rf" "$@"

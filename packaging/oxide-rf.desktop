@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Oxide RF
+GenericName=VHS RF capture and decoder
+Comment=Native Rust PAL VHS RF capture and decoding with OpenCL and live preview (experimental)
+Exec=oxide-rf
+Icon=oxide-rf
+StartupWMClass=oxide-rf
+Categories=AudioVideo;Video;
+Terminal=false

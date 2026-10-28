@@ -1,0 +1,53 @@
+# Builds, tests and lints Oxide RF on Linux, Windows and macOS.
+name: Build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install ALSA and OpenCL development packages
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev ocl-icd-opencl-dev
+
+      # GPU drivers ship OpenCL.dll only; linking needs the OpenCL.lib import library.
+      - name: Install the OpenCL ICD loader
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install opencl:x64-windows
+          $root = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
+          "OPENCL_LIB_DIR=$root\lib" >> $env:GITHUB_ENV
+          "$root\bin" >> $env:GITHUB_PATH
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Clippy
+        run: cargo clippy --release --locked --all-targets -- -D warnings
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oxide-rf-${{ runner.os }}
+          path: |
+            target/release/oxide-rf
+            target/release/oxide-rf.exe
+          if-no-files-found: error
