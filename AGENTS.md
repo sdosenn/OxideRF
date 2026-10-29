@@ -15,7 +15,8 @@ native application or AppImage.
 
 # Commits
 
-Write commit messages as a single short line, with no body.
+Write commit messages as a single short line, with no body. Show the exact
+message to the user before asking whether to commit.
 
 Do not add `Co-Authored-By` or other AI attribution lines to commit messages
 or pull request descriptions.

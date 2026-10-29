@@ -51,3 +51,14 @@ jobs:
             target/release/oxide-rf
             target/release/oxide-rf.exe
           if-no-files-found: error
+
+      - name: Package the macOS app bundle
+        if: runner.os == 'macOS'
+        run: scripts/build-macos-app.sh
+
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'macOS'
+        with:
+          name: oxide-rf-macOS-app
+          path: dist/Oxide-RF-*-macOS.zip
+          if-no-files-found: error
