@@ -9,7 +9,8 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp target/release/oxide-rf "$app/Contents/MacOS/"
 cp assets/icon.icns "$app/Contents/Resources/oxide-rf.icns"
-sed "s/@VERSION@/$version/g" packaging/Info.plist > "$app/Contents/Info.plist"
+# Bundle versions must be numeric, so drop a pre-release suffix like -beta.
+sed "s/@VERSION@/${version%%-*}/g" packaging/Info.plist > "$app/Contents/Info.plist"
 cp LICENSE THIRD_PARTY_NOTICES.md "$app/Contents/Resources/"
 # Ad-hoc signature so Apple silicon runs the bundle; not a Developer ID.
 codesign --force --sign - "$app"

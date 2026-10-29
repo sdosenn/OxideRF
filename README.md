@@ -5,7 +5,7 @@ Capture RF, decode and record VHS tapes in real time.
 
 <!-- <p align="left">
   <a href="https://github.com/sdosenn/OxideRF/releases/latest">
-    <img src="https://img.shields.io/badge/Download_latest_release-0.3.2-2ea44f?style=for-the-badge&logo=github" alt="Download Oxide RF 0.3.2">
+    <img src="https://img.shields.io/badge/Download_latest_release-0.3.2--beta-2ea44f?style=for-the-badge&logo=github" alt="Download Oxide RF 0.3.2-beta">
   </a>
 </p>-->
 
@@ -143,8 +143,8 @@ Packed `.lds`/`.r30` input is not supported.
 ### Linux AppImage
 
 ```bash
-chmod +x Oxide-RF-0.3.2-x86_64.AppImage
-./Oxide-RF-0.3.2-x86_64.AppImage
+chmod +x Oxide-RF-0.3.2-beta-x86_64.AppImage
+./Oxide-RF-0.3.2-beta-x86_64.AppImage
 ```
 
 Needs x86_64 Linux with glibc 2.39 or newer (Ubuntu 24.04 or later) and an
@@ -184,7 +184,7 @@ picture is embedded from `assets/about.png` or `assets/about.jpg` (401 × 500).
 
 ## Status
 
-- Current development version: **0.3.2**
+- Current development version: **0.3.2-beta**
 - Experimental; actively developed and used for real captures.
 - Equal quality to vhs-decode has not been established.
 - Licensed under GPL-3.0-or-later.
