@@ -82,6 +82,8 @@ struct App {
     about_texture: Option<egui::TextureHandle>,
     /// Where About opens, fixed when it opens so it can still be moved.
     about_position: Option<egui::Pos2>,
+    /// About shows the third-party notices in place of the picture.
+    about_notices: bool,
     #[cfg(target_os = "macos")]
     menu: Option<macos_menu::MacMenu>,
     /// Workspace height around the preview picture in the last frame.
@@ -167,6 +169,7 @@ impl Default for App {
             show_about: false,
             about_texture: None,
             about_position: None,
+            about_notices: false,
             #[cfg(target_os = "macos")]
             menu: None,
             workspace_chrome: 160.0,
@@ -782,6 +785,84 @@ impl App {
         self.settings_changed = None;
     }
 }
+/// The project licence and THIRD_PARTY_NOTICES.md, shown in About.
+fn third_party_notices(ui: &mut egui::Ui, size: egui::Vec2) {
+    const NOTICES: &str = include_str!("../THIRD_PARTY_NOTICES.md");
+    let (area, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(area));
+    ui.painter()
+        .rect_filled(area, egui::CornerRadius::same(6), theme::CARD);
+    egui::Frame::new().inner_margin(12).show(&mut ui, |ui| {
+        egui::ScrollArea::vertical()
+            .id_salt("about-notices")
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                // Text rows, not the theme's tall control rows.
+                ui.spacing_mut().interact_size.y = 19.0;
+                ui.spacing_mut().item_spacing.y = 2.0;
+                notice_heading(ui, "License");
+                notice_paragraph(
+                    ui,
+                    "Oxide RF is free software under the GNU General Public License, \
+                     version 3 or later: https://www.gnu.org/licenses/gpl-3.0.html",
+                    false,
+                );
+                for block in NOTICES.split("\n\n") {
+                    let block = block.trim();
+                    if let Some(heading) = block.strip_prefix("# ") {
+                        ui.add_space(8.0);
+                        notice_heading(ui, heading);
+                    } else if block.starts_with("- ") {
+                        for item in block.split("\n- ") {
+                            notice_paragraph(ui, item.trim_start_matches("- "), true);
+                        }
+                    } else if !block.is_empty() {
+                        notice_paragraph(ui, block, false);
+                    }
+                }
+            });
+    });
+}
+fn notice_heading(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        egui::RichText::new(text)
+            .size(16.0)
+            .color(theme::TEXT)
+            .family(egui::FontFamily::Name(theme::MEDIUM.into())),
+    );
+}
+/// One wrapped paragraph or bullet: `code` in monospace and URLs as short
+/// links with the full address on hover.
+fn notice_paragraph(ui: &mut egui::Ui, text: &str, bullet: bool) {
+    ui.add_space(if bullet { 2.0 } else { 8.0 });
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+        ui.style_mut().override_font_id = Some(egui::FontId::proportional(13.5));
+        if bullet {
+            ui.label("•  ");
+        }
+        for word in text.split_whitespace() {
+            if word.starts_with("https://") {
+                let address = word.trim_end_matches(['.', ',', ')']);
+                let path = address.trim_start_matches("https://").trim_end_matches('/');
+                let short = match (path.split_once('/'), path.rsplit_once('/')) {
+                    (Some((host, _)), Some((_, last))) if path.len() > 40 => {
+                        format!("{host}/…/{last}")
+                    }
+                    _ => path.to_owned(),
+                };
+                ui.hyperlink_to(short, address).on_hover_text(address);
+                ui.label(format!("{} ", &word[address.len()..]));
+            } else if let Some(code) = word.strip_prefix('`') {
+                let (code, rest) = code.split_once('`').unwrap_or((code, ""));
+                ui.label(egui::RichText::new(code).monospace().size(12.0));
+                ui.label(format!("{rest} "));
+            } else {
+                ui.label(format!("{} ", word.replace('`', "")));
+            }
+        }
+    });
+}
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         #[cfg(feature = "ui-screenshot")]
@@ -986,6 +1067,7 @@ impl eframe::App for App {
         #[cfg(feature = "ui-screenshot")]
         if ctx.cumulative_pass_nr() == 20 && std::env::var_os("VHS_GUI_ABOUT_DIALOG").is_some() {
             self.show_about = true;
+            self.about_notices = std::env::var_os("VHS_GUI_ABOUT_NOTICES").is_some();
         }
         #[cfg(target_os = "macos")]
         for action in self.menu.as_ref().map(|m| m.actions()).unwrap_or_default() {
@@ -1126,15 +1208,18 @@ impl App {
     fn about_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_about {
             self.about_position = None;
+            self.about_notices = false;
             return;
         }
         const PICTURE: egui::Vec2 = egui::vec2(401.0, 500.0);
-        let size = egui::vec2(PICTURE.x + 32.0, PICTURE.y + 122.0);
+        let size = egui::vec2(PICTURE.x + 32.0, PICTURE.y + 138.0);
         // Windows places new windows at its cascade position, not over the
         // parent, so centre About on the main window explicitly.
         let position = *self.about_position.get_or_insert_with(|| {
             let main = ctx.input(|i| i.viewport().outer_rect.or(i.viewport().inner_rect));
-            main.map_or(egui::Pos2::ZERO, |main| (main.center() - size / 2.0).max(main.min))
+            main.map_or(egui::Pos2::ZERO, |main| {
+                (main.center() - size / 2.0).max(main.min)
+            })
         });
         if self.about_texture.is_none() {
             self.about_texture = ABOUT_IMAGE
@@ -1199,7 +1284,9 @@ impl App {
     }
     fn about_contents(&mut self, ui: &mut egui::Ui, picture: egui::Vec2) {
         ui.set_width(picture.x);
-        ui.vertical_centered(|ui| {
+        if self.about_notices {
+            third_party_notices(ui, picture);
+        } else {
             let (area, _) = ui.allocate_exact_size(picture, egui::Sense::hover());
             let painter = ui.painter_at(area);
             match &self.about_texture {
@@ -1239,8 +1326,20 @@ impl App {
                 }
                 painter.text(at, egui::Align2::CENTER_TOP, text, font, colour);
             }
-            ui.add_space(10.0);
+        }
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
             ui.label("Created by: Siniša Došen  © 2026");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let text = if self.about_notices {
+                    "Back"
+                } else {
+                    "Credits and licenses"
+                };
+                if ui.link(egui::RichText::new(text).size(13.0)).clicked() {
+                    self.about_notices = !self.about_notices;
+                }
+            });
         });
         ui.add_space(10.0);
         let link = |ui: &mut egui::Ui, icon: egui::RichText, text: &str, url: &str| {
@@ -2507,6 +2606,15 @@ fn main() -> eframe::Result {
                 app.vbi_enabled = std::env::var_os("VHS_GUI_VBI_FIXTURE").is_some();
                 app.burn_teletext = app.vbi_enabled;
                 app.show_settings = std::env::var_os("VHS_GUI_SETTINGS_DIALOG").is_some();
+                // A screenshot of About draws it inside the main window, which
+                // the screenshot captures.
+                if std::env::var_os("VHS_GUI_ABOUT_DIALOG").is_some()
+                    && std::env::var_os("VHS_GUI_SCREENSHOT").is_some()
+                {
+                    cc.egui_ctx.set_embed_viewports(true);
+                    app.show_about = true;
+                    app.about_notices = std::env::var_os("VHS_GUI_ABOUT_NOTICES").is_some();
+                }
                 app.dropout_correct = std::env::var_os("VHS_GUI_DROPOUT_FIXTURE").is_some();
             }
             #[cfg(feature = "ui-screenshot")]
