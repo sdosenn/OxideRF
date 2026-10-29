@@ -1140,8 +1140,15 @@ impl Output {
         let mut locked = Vec::new();
         let mut porches = Vec::new();
         let mut tips = Vec::new();
+        // Predict each line from the last located sync and the measured line
+        // period. Tape speed error accumulates over a field and would otherwise
+        // move later syncs outside the search window around the nominal raster.
+        let mut previous: Option<(usize, f64)> = None;
+        let mut period = line;
         for row in 0..=HEIGHT {
-            let predicted = origin + row as f64 * line;
+            let predicted = previous.map_or(origin + row as f64 * line, |(r, p)| {
+                p + (row - r) as f64 * period
+            });
             let index = pulses
                 .horizontal
                 .partition_point(|&p| (p as f64) < predicted);
@@ -1174,6 +1181,17 @@ impl Output {
                 }
                 data.base as f64 + refined
             });
+            // Only syncs close to the prediction may steer it, so a noise pulse
+            // inside the search window cannot drag the following lines away.
+            if *locked.last().unwrap() && (position - predicted).abs() < 2e-6 * fs {
+                if let Some((r, p)) = previous {
+                    let measured = (position - p) / (row - r) as f64;
+                    if (measured - line).abs() < line * 0.01 {
+                        period += (measured - period) * 0.2;
+                    }
+                }
+                previous = Some((row, position));
+            }
             locations.push(position);
         }
         if let Some(pipeline) = gpu.as_deref_mut() {
