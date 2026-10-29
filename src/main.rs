@@ -8,6 +8,8 @@ use std::{
 };
 use vhs_opencl::preview;
 
+#[cfg(target_os = "macos")]
+mod macos_menu;
 mod settings;
 mod theme;
 
@@ -78,6 +80,8 @@ struct App {
     show_settings: bool,
     show_about: bool,
     about_texture: Option<egui::TextureHandle>,
+    #[cfg(target_os = "macos")]
+    menu: Option<macos_menu::MacMenu>,
     /// Workspace height around the preview picture in the last frame.
     workspace_chrome: f32,
     /// Width the start/stop button and preview switches need on one row.
@@ -160,6 +164,8 @@ impl Default for App {
             show_settings: false,
             show_about: false,
             about_texture: None,
+            #[cfg(target_os = "macos")]
+            menu: None,
             workspace_chrome: 160.0,
             toolbar_width: 800.0,
             header_texture: None,
@@ -978,6 +984,18 @@ impl eframe::App for App {
         if ctx.cumulative_pass_nr() == 20 && std::env::var_os("VHS_GUI_ABOUT_DIALOG").is_some() {
             self.show_about = true;
         }
+        #[cfg(target_os = "macos")]
+        for action in self.menu.as_ref().map(|m| m.actions()).unwrap_or_default() {
+            match action {
+                macos_menu::Action::About => self.show_about = true,
+                macos_menu::Action::Settings => self.show_settings = true,
+                macos_menu::Action::Quit => {
+                    ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close)
+                }
+            }
+        }
+        // On macOS Settings and About are in the menu bar instead.
+        #[cfg(not(target_os = "macos"))]
         self.top_bar(ctx);
         self.settings_dialog(ctx, running);
         self.about_dialog(ctx);
@@ -1261,6 +1279,7 @@ impl App {
             });
         });
     }
+    #[cfg(not(target_os = "macos"))]
     fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("title-bar")
             .frame(
@@ -2461,6 +2480,10 @@ fn main() -> eframe::Result {
             let mut app = App::default();
             app.apply_settings(&saved);
             app.saved_settings = app.settings_json();
+            #[cfg(target_os = "macos")]
+            {
+                app.menu = macos_menu::MacMenu::install(&cc.egui_ctx);
+            }
             #[cfg(feature = "ui-screenshot")]
             {
                 app.preview_colour = std::env::var_os("VHS_GUI_COLOUR").is_some();
