@@ -19,6 +19,15 @@ fn main() {
         println!("cargo:rustc-link-arg=-Wl,--wrap=acosf");
     }
     if os == "windows" {
+        // The .exe icon shown by Explorer; the window icon is set at runtime.
+        #[cfg(windows)]
+        {
+            let mut resource = winresource::WindowsResource::new();
+            resource.set_icon("assets/icon.ico");
+            if let Err(err) = resource.compile_for("oxide-rf") {
+                println!("cargo:warning=Windows icon resource not embedded: {err}");
+            }
+        }
         // GPU drivers install OpenCL.dll but not the OpenCL.lib import library
         // needed to link. Look in OPENCL_LIB_DIR, then in a vcpkg installation
         // (`vcpkg install opencl:x64-windows`).

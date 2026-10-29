@@ -13,6 +13,13 @@ Keep the application and its distribution native Rust/OpenCL. Do not introduce a
 Python runtime dependency. Historical Python reference files are not part of the
 native application or AppImage.
 
+# Commits
+
+Write commit messages as a single short line, with no body.
+
+Do not add `Co-Authored-By` or other AI attribution lines to commit messages
+or pull request descriptions.
+
 # README
 
 Do not add to or change `README.md` unless the user explicitly asks for it.

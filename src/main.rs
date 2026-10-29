@@ -80,6 +80,8 @@ struct App {
     show_settings: bool,
     show_about: bool,
     about_texture: Option<egui::TextureHandle>,
+    /// Where About opens, fixed when it opens so it can still be moved.
+    about_position: Option<egui::Pos2>,
     #[cfg(target_os = "macos")]
     menu: Option<macos_menu::MacMenu>,
     /// Workspace height around the preview picture in the last frame.
@@ -164,6 +166,7 @@ impl Default for App {
             show_settings: false,
             show_about: false,
             about_texture: None,
+            about_position: None,
             #[cfg(target_os = "macos")]
             menu: None,
             workspace_chrome: 160.0,
@@ -1122,9 +1125,17 @@ impl App {
     /// links and Close.
     fn about_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_about {
+            self.about_position = None;
             return;
         }
         const PICTURE: egui::Vec2 = egui::vec2(401.0, 500.0);
+        let size = egui::vec2(PICTURE.x + 32.0, PICTURE.y + 122.0);
+        // Windows places new windows at its cascade position, not over the
+        // parent, so centre About on the main window explicitly.
+        let position = *self.about_position.get_or_insert_with(|| {
+            let main = ctx.input(|i| i.viewport().outer_rect.or(i.viewport().inner_rect));
+            main.map_or(egui::Pos2::ZERO, |main| (main.center() - size / 2.0).max(main.min))
+        });
         if self.about_texture.is_none() {
             self.about_texture = ABOUT_IMAGE
                 .and_then(|bytes| image::load_from_memory(bytes).ok())
@@ -1141,7 +1152,8 @@ impl App {
         let window = egui::ViewportBuilder::default()
             .with_title("About Oxide RF")
             .with_app_id("oxide-rf")
-            .with_inner_size([PICTURE.x + 32.0, PICTURE.y + 122.0])
+            .with_inner_size(size)
+            .with_position(position)
             .with_resizable(false)
             .with_minimize_button(false)
             .with_maximize_button(false)
@@ -2464,6 +2476,10 @@ fn main() -> eframe::Result {
             .with_inner_size(size.unwrap_or([1600.0, 900.0]))
             .with_app_id("oxide-rf")
             .with_title(concat!("Oxide RF ", env!("CARGO_PKG_VERSION")))
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+                    .expect("bundled icon is a valid PNG"),
+            )
             .with_min_inner_size([1180.0, 720.0])
             .with_maximized(maximized)
             // eframe derives the monitor size from Wayland's integer output
