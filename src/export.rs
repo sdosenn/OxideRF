@@ -1928,7 +1928,8 @@ mod tests {
         );
     }
     fn synthetic() -> (Vec<u16>, Capture) {
-        let file = || BufReader::new(File::open("/dev/null").unwrap());
+        let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        let file = || BufReader::new(File::open(null).unwrap());
         let c = Capture {
             luma: Some(file()),
             chroma: Some(file()),

@@ -1,9 +1,15 @@
-# Builds, tests and lints Oxide RF on Linux, Windows and macOS.
+# Builds, tests and lints Oxide RF on Linux, Windows and macOS when a release
+# is published, and attaches the builds to that release. Can also be started
+# by hand from the Actions tab.
 name: Build
 
 on:
-  push:
-  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -62,3 +68,17 @@ jobs:
           name: oxide-rf-macOS-app
           path: dist/Oxide-RF-*-macOS.zip
           if-no-files-found: error
+
+      - name: Attach the build to the release
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          case "$RUNNER_OS" in
+            Linux) cp target/release/oxide-rf "oxide-rf-$TAG-linux-x86_64"; asset="oxide-rf-$TAG-linux-x86_64" ;;
+            Windows) cp target/release/oxide-rf.exe "oxide-rf-$TAG-windows-x86_64.exe"; asset="oxide-rf-$TAG-windows-x86_64.exe" ;;
+            macOS) asset=dist/Oxide-RF-*-macOS.zip ;;
+          esac
+          gh release upload "$TAG" $asset --clobber
