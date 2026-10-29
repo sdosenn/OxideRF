@@ -644,7 +644,7 @@ mod stream_tests {
     use std::{
         io::Write,
         os::{
-            fd::{FromRawFd, IntoRawFd},
+            fd::{AsRawFd, FromRawFd, IntoRawFd},
             unix::net::UnixStream,
         },
     };
@@ -655,6 +655,23 @@ mod stream_tests {
     fn pair(bytes: usize) -> (Stream, UnixStream) {
         let (reader, writer) = UnixStream::pair().unwrap();
         reader.set_nonblocking(true).unwrap();
+        // macOS defaults to 8 KiB socket buffers; with the reader's 2 ms
+        // back-off that moves only a few MB/s, too slow to fill the queue
+        // before the timeouts below.
+        for socket in [&reader, &writer] {
+            for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+                let size: libc::c_int = 1 << 20;
+                unsafe {
+                    libc::setsockopt(
+                        socket.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        option,
+                        (&size as *const libc::c_int).cast(),
+                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                    );
+                }
+            }
+        }
         // Ownership of the socket descriptor moves into File exactly once.
         let file = unsafe { File::from_raw_fd(reader.into_raw_fd()) };
         (
