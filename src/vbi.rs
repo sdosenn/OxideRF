@@ -241,10 +241,22 @@ impl Drop for Server {
 mod tests {
     use super::*;
     use std::io::Read;
+    /// Connects a client and waits until the non-blocking listener has accepted
+    /// it; on a loaded machine that can take longer than the first publish.
+    fn connect(server: &mut Server) -> TcpStream {
+        let client = TcpStream::connect(server.listener.local_addr().unwrap()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while server.client.is_none() {
+            assert!(std::time::Instant::now() < deadline, "client was not accepted");
+            server.accept().unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        client
+    }
     #[test]
     fn raw_stream_starts_at_first_field_and_preserves_u16_sample_order() {
         let mut server = Server::bind("127.0.0.1:0").unwrap();
-        let mut client = TcpStream::connect(server.listener.local_addr().unwrap()).unwrap();
+        let mut client = connect(&mut server);
         client
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
@@ -272,7 +284,7 @@ mod tests {
     #[test]
     fn header_images_map_to_the_decoder_field_of_their_vbi_frame() {
         let mut server = Server::bind("127.0.0.1:0").unwrap();
-        let mut client = TcpStream::connect(server.listener.local_addr().unwrap()).unwrap();
+        let mut client = connect(&mut server);
         let samples = vec![0u16; WIDTH * LINES];
         // A leading second field is not sent; decoder fields 11.. form VBI frames.
         server.publish(&samples, false, 10).unwrap();
