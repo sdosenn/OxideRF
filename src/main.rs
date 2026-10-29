@@ -121,14 +121,14 @@ impl Default for App {
             server: false,
             server_bind: "0.0.0.0:5555".into(),
             live_input: vhs_opencl::cxadc::DEFAULT_DEVICE.into(),
-            cxadc_devices: vhs_opencl::cxadc::devices(),
+            cxadc_devices: hardware(vhs_opencl::cxadc::devices),
             output: String::new(),
             frequency: 315.0 / 11.0,
             frames: 0,
             start: 0,
             sample_format: "auto".into(),
             gpu: true,
-            devices: vhs_opencl::devices(),
+            devices: hardware(vhs_opencl::devices),
             device: 0,
             child: None,
             rx: None,
@@ -149,7 +149,7 @@ impl Default for App {
             dropout_threshold: None,
             server_audio: false,
             audio_source: "default".into(),
-            audio_devices: vhs_opencl::audio::devices(),
+            audio_devices: hardware(vhs_opencl::audio::devices),
             audio_bind: "0.0.0.0:5557".into(),
             audio_monitor: true,
             audio_offset_ms: 0.0,
@@ -2522,6 +2522,15 @@ const METRICS_ONE_ROW_WIDTH: f32 = 680.0;
 const ABOUT_IMAGE: Option<&[u8]> = Some(include_bytes!(env!("OXIDE_ABOUT_IMAGE")));
 #[cfg(not(about_image))]
 const ABOUT_IMAGE: Option<&[u8]> = None;
+/// Device lists for the UI. Unit tests skip them: querying OpenCL and audio
+/// devices from parallel test threads crashed the Windows CI runner.
+fn hardware<T>(list: fn() -> Vec<T>) -> Vec<T> {
+    if cfg!(test) {
+        Vec::new()
+    } else {
+        list()
+    }
+}
 /// Width of the settings column.
 const SETTINGS_WIDTH: f32 = 560.0;
 /// Saved normal window size in points and maximized state.
