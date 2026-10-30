@@ -21,6 +21,8 @@ use std::{
 };
 pub const RATE: u32 = 48_000;
 const FRAMES: usize = 960;
+/// Audio the monitor queues before it starts playing: three packets.
+const MONITOR_PREBUFFER: Duration = Duration::from_millis(60);
 #[cfg(target_os = "linux")]
 const BYTES: usize = FRAMES * 4;
 const MAGIC: &[u8; 8] = b"VHSAUD01";
@@ -636,11 +638,51 @@ impl Blocks {
     }
 }
 
+/// Device-rate samples waiting for the output callback. Like PulseAudio's
+/// prebuffer, playback starts, and restarts after an underrun, only once
+/// `target` samples are queued: packets arrive every 20 ms, so starting on the
+/// first one would run dry between packets and chop the sound at 50 Hz.
+struct Playout {
+    queue: VecDeque<f32>,
+    target: usize,
+    playing: bool,
+    underruns: u64,
+}
+impl Playout {
+    fn new(target: usize) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            target,
+            playing: false,
+            underruns: 0,
+        }
+    }
+    fn fill(&mut self, out: &mut [f32]) {
+        if !self.playing && self.queue.len() >= self.target {
+            self.playing = true;
+        }
+        let mut rest = &mut out[..];
+        if self.playing {
+            let n = rest.len().min(self.queue.len());
+            for (o, s) in rest[..n].iter_mut().zip(self.queue.drain(..n)) {
+                *o = s;
+            }
+            rest = &mut rest[n..];
+            if !rest.is_empty() {
+                self.playing = false;
+                self.underruns += 1;
+            }
+        }
+        rest.fill(0.0);
+    }
+}
+
 /// Plays received 48 kHz stereo PCM on the default output device of any
-/// platform, converted to the device's rate and channel count. Underruns play
-/// silence; more than half a second of backlog drops the oldest samples.
+/// platform, converted to the device's rate and channel count. Playback waits
+/// for [`MONITOR_PREBUFFER`] of audio; more than half a second of backlog drops
+/// the oldest samples.
 struct Monitor {
-    buffer: Arc<Mutex<VecDeque<f32>>>,
+    buffer: Arc<Mutex<Playout>>,
     _stream: cpal::Stream,
     channels: usize,
     step: f64,
@@ -668,14 +710,10 @@ impl Monitor {
         let config = supported.config();
         let channels = config.channels as usize;
         let rate = config.sample_rate;
-        let buffer = Arc::new(Mutex::new(VecDeque::new()));
+        let target = (rate as f64 * MONITOR_PREBUFFER.as_secs_f64()) as usize * channels;
+        let buffer = Arc::new(Mutex::new(Playout::new(target)));
         let source = buffer.clone();
-        let fill = move |out: &mut [f32]| {
-            let mut queue = source.lock().unwrap();
-            for sample in out {
-                *sample = queue.pop_front().unwrap_or(0.0);
-            }
-        };
+        let fill = move |out: &mut [f32]| source.lock().unwrap().fill(out);
         let error = |e| eprintln!("Audio monitor: {e}");
         let stream = match supported.sample_format() {
             cpal::SampleFormat::F32 => device.build_output_stream::<f32, _, _>(
@@ -751,10 +789,18 @@ impl Monitor {
         }
         self.position -= (frames.len() - 1) as f64;
         self.last = *frames.last().unwrap();
-        let mut queue = self.buffer.lock().unwrap();
-        queue.extend(out);
-        let excess = queue.len().saturating_sub(self.limit);
-        queue.drain(..excess - excess % self.channels);
+        let mut playout = self.buffer.lock().unwrap();
+        playout.queue.extend(out);
+        let excess = playout.queue.len().saturating_sub(self.limit);
+        playout.queue.drain(..excess - excess % self.channels);
+    }
+}
+impl Drop for Monitor {
+    fn drop(&mut self) {
+        println!(
+            "AUDIO_MONITOR underruns={}",
+            self.buffer.lock().unwrap().underruns
+        );
     }
 }
 
@@ -965,6 +1011,41 @@ impl ExportTrack {
         }
     }
 }
+/// Fields between audio rate corrections: 10 s.
+const ALIGN_SEGMENT: usize = 500;
+/// The audio interval of each field in a run of consecutive fields, given the
+/// audio position at which each field starts. Positions are fitted over
+/// ±[`ALIGN_SEGMENT`] fields at every segment boundary and joined linearly, so
+/// the playback rate is constant for 10 s and changes only slightly between
+/// segments, while field-to-field timing jitter is ignored.
+fn smooth_spans(targets: &[f64]) -> Vec<(f64, f64)> {
+    let len = targets.len();
+    let fit = |at: usize| {
+        let from = at.saturating_sub(ALIGN_SEGMENT);
+        let to = (at + ALIGN_SEGMENT).min(len);
+        let n = (to - from) as f64;
+        let mean_x = (from + to - 1) as f64 / 2.0;
+        let mean_y = targets[from..to].iter().sum::<f64>() / n;
+        let (mut sxy, mut sxx) = (0.0, 0.0);
+        for (i, &y) in targets[from..to].iter().enumerate() {
+            let x = (from + i) as f64 - mean_x;
+            sxy += x * (y - mean_y);
+            sxx += x * x;
+        }
+        mean_y + sxy / sxx * (at as f64 - mean_x)
+    };
+    let anchors: Vec<(usize, f64)> = (0..len)
+        .step_by(ALIGN_SEGMENT)
+        .chain([len])
+        .map(|at| (at, fit(at)))
+        .collect();
+    let position = |field: usize| {
+        let j = (field / ALIGN_SEGMENT).min(anchors.len() - 2);
+        let ((a, va), (b, vb)) = (anchors[j], anchors[j + 1]);
+        va + (vb - va) * (field - a) as f64 / (b - a) as f64
+    };
+    (0..len).map(|f| (position(f), position(f + 1))).collect()
+}
 fn audio_position(points: &[(f64, f64)], rf: f64, rate: f64) -> f64 {
     if points.len() == 1 {
         return points[0].1 + (rf - points[0].0) * RATE as f64 / rate;
@@ -975,8 +1056,9 @@ fn audio_position(points: &[(f64, f64)], rf: f64, rate: f64) -> f64 {
     let (a, b) = (points[upper - 1], points[upper]);
     a.1 + (rf - a.0) * (b.1 - a.1) / (b.0 - a.0)
 }
-/// Render each retained field's audio interval; lost/repeated fields cannot
-/// silently shift all subsequent sound. Average timestamp anchors over 2 s.
+/// Render the audio of the retained fields as one continuous track whose rate
+/// follows the RF clock in 10 s segments; lost/repeated fields cannot shift
+/// all subsequent sound. Average timestamp anchors over 2 s.
 pub(crate) fn export_track(
     base: &str,
     destination: &Path,
@@ -1064,17 +1146,45 @@ pub(crate) fn export_track(
     let mut writer =
         hound::WavWriter::new(std::io::BufWriter::new(file), spec).map_err(|e| e.to_string())?;
     let mut missing = 0usize;
-    for &index in indices {
-        if cancellable && crate::export::cancelled() {
-            return Err("Audio alignment stopped; original recording retained".into());
-        }
-        let rf = *rf_fields
+    let field_rf = |index: usize| -> Result<f64, String> {
+        Ok(*rf_fields
             .get(index)
             .filter(|v| v.is_finite())
             .ok_or("Missing RF field position for audio alignment")?
-            - offset_ms * rate / 1000.0;
-        let begin = audio_position(&points, rf, rate);
-        let end = audio_position(&points, rf + rate * 0.02, rate);
+            - offset_ms * rate / 1000.0)
+    };
+    let rf: Vec<f64> = indices
+        .iter()
+        .map(|&index| field_rf(index))
+        .collect::<Result<_, _>>()?;
+    let targets: Vec<f64> = rf
+        .iter()
+        .map(|&rf| audio_position(&points, rf, rate))
+        .collect();
+    // Audio never jumps within a run: a lost or repeated field is absorbed by
+    // the gradual rate correction. Runs break only where the picture itself
+    // jumps back or skips more than a second.
+    let mut spans = Vec::with_capacity(indices.len());
+    let mut start = 0;
+    while start < indices.len() {
+        let mut end = start + 1;
+        while end < indices.len()
+            && (0.0..=RATE as f64).contains(&(targets[end] - targets[end - 1]))
+        {
+            end += 1;
+        }
+        if end - start == 1 {
+            let next = audio_position(&points, rf[start] + rate * 0.02, rate);
+            spans.push((targets[start], next));
+        } else {
+            spans.extend(smooth_spans(&targets[start..end]));
+        }
+        start = end;
+    }
+    for &(begin, end) in &spans {
+        if cancellable && crate::export::cancelled() {
+            return Err("Audio alignment stopped; original recording retained".into());
+        }
         if end <= begin || end - begin > RATE as f64 * 0.1 {
             return Err("Invalid audio clock interval".into());
         }
@@ -1228,7 +1338,36 @@ mod tests {
         // 0.3 s of silence at 48 kHz stereo.
         monitor.push(&vec![0u8; 48_000 * 4 * 3 / 10]);
         thread::sleep(Duration::from_millis(400));
-        assert!(monitor.buffer.lock().unwrap().len() < monitor.limit);
+        assert!(monitor.buffer.lock().unwrap().queue.len() < monitor.limit);
+    }
+    /// One minute of 20 ms packets with up to 15 ms of arrival jitter, drained
+    /// by a 512-frame device callback whose clock runs 0.1 % faster than the
+    /// capture card's, as two unsynchronized crystals can (exaggerated).
+    fn playout_underruns(target: usize) -> u64 {
+        let mut playout = Playout::new(target);
+        let mut out = vec![0f32; 512 * 2];
+        let mut next_packet = 0.0;
+        let mut packet = 0u64;
+        let callback_period = 512.0 / (48_000.0 * 1.001);
+        for callback in 0..(60.0 / callback_period) as u64 {
+            let now = callback as f64 * callback_period;
+            while next_packet <= now {
+                playout.queue.extend(std::iter::repeat_n(0.5, FRAMES * 2));
+                packet += 1;
+                let jitter = (packet * 7919 % 16) as f64 / 1000.0;
+                next_packet = packet as f64 * 0.02 + jitter;
+            }
+            playout.fill(&mut out);
+        }
+        playout.underruns
+    }
+    #[test]
+    fn monitor_prebuffer_rides_out_packet_jitter_and_clock_drift() {
+        // Starting on the first packet leaves no reserve: once the faster
+        // device clock has caught up, late packets keep running dry.
+        assert!(playout_underruns(0) >= 10);
+        // A 60 ms reserve lasts 60 s at this drift.
+        assert!(playout_underruns(48 * 60 * 2) <= 1);
     }
     #[test]
     fn receiver_preserves_pcm_and_reports_missing_end_marker_or_truncated_payload() {
@@ -1297,6 +1436,112 @@ mod tests {
         }
     }
     #[test]
+    fn audio_rate_is_constant_per_segment_and_follows_slow_speed_changes() {
+        // 30 s of fields whose measured starts jitter by up to ±3 samples,
+        // on a clock 0.02 % fast that slows by 0.5 % after 15 s.
+        let mut targets = Vec::new();
+        let mut position = 0.0;
+        for field in 0..1500u64 {
+            let jitter = ((field * 7919 % 13) as f64 - 6.0) * 0.5;
+            targets.push(position + jitter);
+            position += 960.0 * 1.0002 * if field < 750 { 1.0 } else { 0.995 };
+        }
+        let spans = smooth_spans(&targets);
+        for pair in spans.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "audio must stay continuous");
+        }
+        for segment in spans.chunks(ALIGN_SEGMENT) {
+            let length = segment[0].1 - segment[0].0;
+            assert!(segment.iter().all(|s| (s.1 - s.0 - length).abs() < 1e-6));
+        }
+        let end = spans.last().unwrap().1;
+        assert!(
+            (end - position).abs() < 48.0,
+            "audio drifted {} samples",
+            end - position
+        );
+    }
+    #[test]
+    fn lost_field_is_absorbed_gradually_instead_of_cut() {
+        // 30 s of fields at 960 samples each; field 750 was lost.
+        let targets: Vec<f64> = (0..1501u64)
+            .filter(|&f| f != 750)
+            .map(|f| f as f64 * 960.0)
+            .collect();
+        let spans = smooth_spans(&targets);
+        for pair in spans.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "audio must stay continuous");
+        }
+        for span in &spans {
+            let rate = (span.1 - span.0) / 960.0;
+            assert!((rate - 1.0).abs() < 0.003, "rate {rate}");
+        }
+        // Back in sync once the correction window has passed.
+        assert!((spans[1400].0 - 1401.0 * 960.0).abs() < 48.0);
+    }
+    #[test]
+    fn consecutive_fields_get_continuous_audio_despite_uneven_field_timing() {
+        let dir = std::env::temp_dir().join(format!(
+            "vhs-audio-continuous-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("capture");
+        let base = base.to_str().unwrap();
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: RATE,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        // A ramp shows any skipped or repeated audio as a jump.
+        let mut wav = hound::WavWriter::create(format!("{base}.audio.wav"), spec).unwrap();
+        for i in 0..30000i16 {
+            wav.write_sample(i).unwrap();
+            wav.write_sample(-i).unwrap();
+        }
+        wav.finalize().unwrap();
+        let rf_rate = 28e6;
+        let points: Vec<Value> = (0..600)
+            .map(|i| json!([i * 48, i as f64 * 48.0 / RATE as f64 * rf_rate]))
+            .collect();
+        std::fs::write(
+            format!("{base}.audio.json"),
+            serde_json::to_vec(
+                &json!({"sampleRate":RATE,"channels":2,"rfSampleRate":rf_rate,"points":points}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // Tape speed wanders by up to 0.5 % from field to field.
+        let mut fields = vec![0.0];
+        for i in 0..20 {
+            let period = 0.02 * (1.0 + [0.005, -0.003, 0.002, -0.005][i % 4]);
+            fields.push(fields[i] + period * rf_rate);
+        }
+        let indices: Vec<usize> = (0..20).collect();
+        let track = export_track(base, &dir.join("test.mkv"), &fields, &indices, 0.0, true)
+            .unwrap()
+            .unwrap();
+        let samples = hound::WavReader::open(&track.path)
+            .unwrap()
+            .samples::<i16>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let left: Vec<i32> = samples.iter().step_by(2).map(|&s| s as i32).collect();
+        let worst = left.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+        assert!(
+            worst <= 2,
+            "audio jumps {worst} samples at a field boundary"
+        );
+        drop(track);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn alignment_compensates_clock_drift_skipped_fields_and_user_offset() {
         let dir = std::env::temp_dir().join(format!(
             "vhs-audio-align-{}-{}",
@@ -1351,7 +1596,7 @@ mod tests {
         assert_eq!(samples[1], -samples[0]);
         assert!(
             (samples[1920] as i32 - 2424).abs() <= 1,
-            "Skipped RF field must skip matching audio"
+            "A skipped RF field must not delay later audio"
         );
         drop(track);
         std::fs::remove_dir_all(dir).unwrap();
