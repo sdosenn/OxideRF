@@ -49,6 +49,7 @@ pub(crate) fn install_stop_handler() -> Result<(), String> {
 }
 
 #[derive(Clone, Copy, Default)]
+#[repr(C)]
 pub(crate) struct C {
     pub(crate) re: f32,
     pub(crate) im: f32,
@@ -75,32 +76,31 @@ impl C {
 }
 struct PalFilters {
     rate: f64,
+    rf: Vec<f32>,
+    under: Vec<f32>,
     video: Vec<C>,
     sync: Vec<f32>,
 }
-struct Fft {
-    filters: std::cell::RefCell<Option<PalFilters>>,
-    gpu: bool,
-    twiddle: Vec<C>,
-}
-impl Fft {
-    fn new(gpu: bool) -> Self {
+impl PalFilters {
+    fn new(rate: f64) -> Self {
+        let positive = |gain: &dyn Fn(f64) -> f32| {
+            (0..N)
+                .map(|k| {
+                    if k < N / 2 {
+                        gain(k as f64 * rate / N as f64)
+                    } else {
+                        0.0
+                    }
+                })
+                .collect()
+        };
         Self {
-            filters: std::cell::RefCell::new(None),
-            gpu,
-            twiddle: (0..N / 2)
-                .map(|i| C::polar(-std::f64::consts::TAU * i as f64 / N as f64))
-                .collect(),
-        }
-    }
-    fn pal_filters(&self, rate: f64) -> std::cell::Ref<'_, PalFilters> {
-        if self
-            .filters
-            .borrow()
-            .as_ref()
-            .is_none_or(|f| f.rate != rate)
-        {
-            let video = (0..N)
+            rate,
+            rf: positive(&|f| pal_rf_gain(f, rate)),
+            under: positive(&|f| {
+                2.0 * (1.0 - lowpass(f, 0.15e6, 0.1e6)) * lowpass(f, 1.0e6, 0.15e6)
+            }),
+            video: (0..N)
                 .map(|k| {
                     let signed = if k <= N / 2 {
                         k as f64
@@ -109,66 +109,86 @@ impl Fft {
                     };
                     pal_video_gain(signed * rate / N as f64, rate)
                 })
-                .collect();
-            let sync = (0..N)
+                .collect(),
+            sync: (0..N)
                 .map(|k| pal_sync_gain(k.min(N - k) as f64 * rate / N as f64))
-                .collect();
-            *self.filters.borrow_mut() = Some(PalFilters { rate, video, sync });
+                .collect(),
         }
-        std::cell::Ref::map(self.filters.borrow(), |v| v.as_ref().unwrap())
+    }
+}
+/// CPU FFT and the frequency-domain filters for one RF rate. Shared by the
+/// demodulation threads, so it holds no interior mutability on the hot path.
+struct Fft {
+    filters: std::sync::Mutex<Option<std::sync::Arc<PalFilters>>>,
+    forward: std::sync::Arc<dyn rustfft::Fft<f32>>,
+    inverse: std::sync::Arc<dyn rustfft::Fft<f32>>,
+}
+impl Fft {
+    fn new() -> Self {
+        let mut planner = rustfft::FftPlanner::new();
+        Self {
+            filters: std::sync::Mutex::new(None),
+            forward: planner.plan_fft_forward(N),
+            inverse: planner.plan_fft_inverse(N),
+        }
+    }
+    fn pal_filters(&self, rate: f64) -> std::sync::Arc<PalFilters> {
+        let mut filters = self.filters.lock().unwrap();
+        if filters.as_ref().is_none_or(|f| f.rate != rate) {
+            *filters = Some(std::sync::Arc::new(PalFilters::new(rate)));
+        }
+        filters.as_ref().unwrap().clone()
     }
     fn run(&self, x: &mut [C], inverse: bool) -> Result<(), String> {
-        if self.gpu {
-            let input: Vec<f32> = x.iter().flat_map(|c| [c.re, c.im]).collect();
-            let mut output = vec![0f32; 2 * N];
-            if unsafe { crate::vhs_fft(input.as_ptr(), output.as_mut_ptr(), N, inverse as i32) }
-                != 0
-            {
-                let p = crate::vhs_error();
-                let error = unsafe { std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned() };
-                unsafe {
-                    crate::vhs_free_error(p);
-                }
-                return Err(error);
-            }
-            for (c, v) in x.iter_mut().zip(output.as_chunks::<2>().0) {
-                *c = C { re: v[0], im: v[1] };
+        if x.len() != N {
+            return Err("FFT block has the wrong length".into());
+        }
+        // SAFETY: C is #[repr(C)] { re: f32, im: f32 }, the layout of Complex<f32>.
+        let data = unsafe {
+            std::slice::from_raw_parts_mut(
+                x.as_mut_ptr().cast::<rustfft::num_complex::Complex<f32>>(),
+                N,
+            )
+        };
+        if inverse {
+            self.inverse.process(data);
+            for c in data {
+                *c *= 1.0 / N as f32;
             }
         } else {
-            for i in 0..N {
-                let j = i.reverse_bits() >> (usize::BITS - N.trailing_zeros());
-                if j > i {
-                    x.swap(i, j);
-                }
-            }
-            for bits in 1..=N.trailing_zeros() {
-                let width = 1 << bits;
-                for base in (0..N).step_by(width) {
-                    for j in 0..width / 2 {
-                        let mut w = self.twiddle[j * N / width];
-                        if inverse {
-                            w.im = -w.im;
-                        }
-                        let u = x[base + j];
-                        let t = x[base + j + width / 2].mul(w);
-                        x[base + j] = C {
-                            re: u.re + t.re,
-                            im: u.im + t.im,
-                        };
-                        x[base + j + width / 2] = C {
-                            re: u.re - t.re,
-                            im: u.im - t.im,
-                        };
-                    }
-                }
-            }
-            if inverse {
-                for c in x {
-                    *c = c.scale(1.0 / N as f32);
-                }
-            }
+            self.forward.process(data);
         }
         Ok(())
+    }
+}
+
+/// Paces the GUI preview while recording. Fields are streamed in adjacent
+/// pairs, so the GUI can weave a frame, at most once per PAL frame period and
+/// never so often that rendering takes more than a quarter of the decode time.
+/// Decoding a file faster than real time would otherwise spend its time on
+/// previews that the GUI drops.
+#[derive(Default)]
+struct PreviewPacer {
+    started: Option<std::time::Instant>,
+    owed: bool,
+    cost: std::time::Duration,
+    last_cost: std::time::Duration,
+}
+impl PreviewPacer {
+    fn due(&mut self) -> bool {
+        if self.owed {
+            self.owed = false;
+            return true;
+        }
+        // Slightly under 40 ms so timing jitter at real-time speed keeps every frame.
+        let interval = (self.last_cost * 4).max(std::time::Duration::from_millis(35));
+        if self.started.is_some_and(|t| t.elapsed() < interval) {
+            return false;
+        }
+        self.started = Some(std::time::Instant::now());
+        self.owed = true;
+        self.last_cost = std::mem::take(&mut self.cost);
+        true
     }
 }
 
@@ -483,6 +503,7 @@ impl Samples {
         self.base += n as u64;
     }
 }
+#[cfg(test)]
 fn demod(raw: &[f32], fs: f64, fft: &Fft, absolute: u64) -> Result<Samples, String> {
     demod_mode(raw, fs, fft, absolute, false)
 }
@@ -502,12 +523,13 @@ fn demod_mode(
         })
         .collect();
     fft.run(&mut spectrum, false)?;
-    let mut analytic = spectrum.clone();
-    for (k, x) in analytic.iter_mut().enumerate() {
-        let f = k as f64 * fs / N as f64;
-        let gain = if k < N / 2 { pal_rf_gain(f, fs) } else { 0.0 };
-        *x = x.scale(gain);
-    }
+    // Reuse the frequency-domain filters across RF blocks.
+    let filters = fft.pal_filters(fs);
+    let mut analytic: Vec<C> = spectrum
+        .iter()
+        .zip(&filters.rf)
+        .map(|(x, gain)| x.scale(*gain))
+        .collect();
     fft.run(&mut analytic, true)?;
     let mut freq = vec![C::default(); N];
     for i in 1..N {
@@ -520,8 +542,6 @@ fn demod_mode(
     }
     freq[0] = freq[1];
     fft.run(&mut freq, false)?;
-    // Reuse the frequency-domain filters across RF blocks.
-    let filters = fft.pal_filters(fs);
     for (x, gain) in freq.iter_mut().zip(&filters.video) {
         *x = x.mul(*gain);
     }
@@ -532,24 +552,34 @@ fn demod_mode(
     fft.run(&mut sync, true)?;
     fft.run(&mut freq, true)?;
     if !luma_only {
-        for (k, x) in spectrum.iter_mut().enumerate() {
-            let f = k as f64 * fs / N as f64;
-            *x = x.scale(if k < N / 2 {
-                2.0 * (1.0 - lowpass(f, 0.15e6, 0.1e6)) * lowpass(f, 1.0e6, 0.15e6)
-            } else {
-                0.0
-            });
+        for (x, gain) in spectrum.iter_mut().zip(&filters.under) {
+            *x = x.scale(*gain);
         }
         fft.run(&mut spectrum, true)?;
     }
     let chroma = if luma_only {
         vec![C::default(); HOP]
     } else {
+        // Rotate the colour-under carrier with an f64 phasor recurrence,
+        // re-anchored periodically, instead of a sine and cosine per sample.
+        let step = -std::f64::consts::TAU * UNDER / fs;
+        let rotate = (step.cos(), step.sin());
+        let mut phasor = (0.0, 0.0);
         (EDGE..N - EDGE)
             .map(|i| {
-                spectrum[i].mul(C::polar(
-                    -std::f64::consts::TAU * UNDER * (absolute + i as u64) as f64 / fs,
-                ))
+                if (i - EDGE).is_multiple_of(1024) {
+                    let a = step * (absolute + i as u64) as f64;
+                    phasor = (a.cos(), a.sin());
+                }
+                let carrier = C {
+                    re: phasor.0 as f32,
+                    im: phasor.1 as f32,
+                };
+                phasor = (
+                    phasor.0 * rotate.0 - phasor.1 * rotate.1,
+                    phasor.0 * rotate.1 + phasor.1 * rotate.0,
+                );
+                spectrum[i].mul(carrier)
             })
             .collect()
     };
@@ -689,12 +719,16 @@ fn interpolate_c(v: &[C], p: f64) -> C {
     }
 }
 
+#[cfg(test)]
 fn restore_chroma(under: C, phase: f64, target: f64) -> C {
+    restore_chroma_rotated(under, C::polar(target + phase))
+}
+fn restore_chroma_rotated(under: C, rotation: C) -> C {
     C {
         re: under.re,
         im: -under.im,
     }
-    .mul(C::polar(target + phase))
+    .mul(rotation)
 }
 fn pal_chroma_flip(bursts: &[(f64, f32)]) -> bool {
     let mut track = 0.0;
@@ -912,6 +946,7 @@ struct Output {
     colour_cpu: Option<crate::export::Cpu>,
     last_colour_preview: Option<crate::preview::PreviewFrame>,
     colour_pair_pending: bool,
+    socket_pacer: PreviewPacer,
     /// Preview the full TBC raster instead of the active 4:3 picture.
     full_raster: bool,
     raster_chroma: crate::preview::RasterChroma,
@@ -976,6 +1011,7 @@ impl Output {
             colour_cpu: None,
             last_colour_preview: None,
             colour_pair_pending: false,
+            socket_pacer: PreviewPacer::default(),
             full_raster: false,
             raster_chroma: crate::preview::RasterChroma::Active,
             teletext_headers: false,
@@ -1366,8 +1402,6 @@ impl Output {
         let mut pixels = if let Some(pipeline) = gpu.as_deref_mut() {
             pipeline.field(&locations, &locked, blank)?
         } else {
-            let mut y = Vec::with_capacity(WIDTH * HEIGHT);
-            let mut c = Vec::with_capacity(WIDTH * HEIGHT);
             let mut bursts: Vec<(f64, f32)> = (0..HEIGHT)
                 .map(|row| {
                     let a = locations[row] - data.base as f64;
@@ -1387,13 +1421,17 @@ impl Output {
                 .collect();
             smooth_chroma_gains(&mut bursts);
             let flip = pal_chroma_flip(&bursts);
-            for row in 0..HEIGHT {
+            let carriers: Vec<C> = (0..WIDTH)
+                .map(|x| C::polar(std::f64::consts::TAU * FSC * x as f64 / OUT_RATE))
+                .collect();
+            // Rows are independent once line locations and bursts are known.
+            let render = |row: usize, y: &mut [u16], c: &mut [u16]| {
                 let a = locations[row] - data.base as f64;
                 let step = (locations[row + 1] - locations[row]) / WIDTH as f64;
                 let (phase, gain) = bursts[row];
                 let target = pal_burst_phase(row)
                     + if flip {
-                        if row % 2 == 0 {
+                        if row.is_multiple_of(2) {
                             std::f64::consts::FRAC_PI_2
                         } else {
                             -std::f64::consts::FRAC_PI_2
@@ -1401,25 +1439,42 @@ impl Output {
                     } else {
                         0.0
                     };
+                let rotation = C::polar(target + phase);
                 for x in 0..WIDTH {
                     let p = a + x as f64 * step;
                     let hz = interpolate_video(&data.luma, p);
                     let code = 16384.0 + (hz - blank) * (376.32 / 7000.0);
-                    y.push(code.round().clamp(0.0, 65535.0) as u16);
+                    y[x] = code.round().clamp(0.0, 65535.0) as u16;
                     // Align the zero-phase colour-under path with the luma
                     // de-emphasis path (two output samples in the PAL profile).
                     let under = interpolate_c(&data.chroma, p - 2.0 * step);
                     // VHS uses the difference sideband of the fSC + colour-under
                     // heterodyne, which conjugates the analytic colour-under signal.
-                    let baseband = restore_chroma(under, phase, target);
-                    let carrier = C::polar(std::f64::consts::TAU * FSC * x as f64 / OUT_RATE);
-                    c.push(
-                        (32767.0 + baseband.mul(carrier).re * gain)
-                            .round()
-                            .clamp(0.0, 65535.0) as u16,
-                    );
+                    let baseband = restore_chroma_rotated(under, rotation);
+                    c[x] = (32767.0 + baseband.mul(carriers[x]).re * gain)
+                        .round()
+                        .clamp(0.0, 65535.0) as u16;
                 }
-            }
+            };
+            let mut y = vec![0u16; WIDTH * HEIGHT];
+            let mut c = vec![0u16; WIDTH * HEIGHT];
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+            let rows = HEIGHT.div_ceil(threads);
+            std::thread::scope(|scope| {
+                for (chunk, (y, c)) in y
+                    .chunks_mut(rows * WIDTH)
+                    .zip(c.chunks_mut(rows * WIDTH))
+                    .enumerate()
+                {
+                    let render = &render;
+                    scope.spawn(move || {
+                        for (i, (y, c)) in y.chunks_mut(WIDTH).zip(c.chunks_mut(WIDTH)).enumerate()
+                        {
+                            render(chunk * rows + i, y, c);
+                        }
+                    });
+                }
+            });
             y.extend(c);
             y
         };
@@ -1428,14 +1483,17 @@ impl Output {
                 crate::dropout::repair(&mut pixels, map);
             }
         }
-        // While recording, the preview file is refreshed every 200 ms. Render only
-        // the adjacent field pair needed for that frame instead of every field.
+        let socket_due = !self.monitor && self.socket.is_some() && self.socket_pacer.due();
+        let preview_started = std::time::Instant::now();
+        // The preview file is refreshed every 200 ms. Render only the adjacent
+        // field pair needed for that frame instead of every field.
         let colour_due = self.monitor
-            || self.socket.is_some()
-            || self.colour_pair_pending
-            || self
-                .preview_updated
-                .is_none_or(|t| t.elapsed().as_millis() >= 200);
+            || socket_due
+            || (self.socket.is_none()
+                && (self.colour_pair_pending
+                    || self
+                        .preview_updated
+                        .is_none_or(|t| t.elapsed().as_millis() >= 200)));
         if self.colour_preview && colour_due {
             let updated = self.preview_updated;
             let colour = if let Some(pipeline) = gpu {
@@ -1457,6 +1515,9 @@ impl Output {
                 return Ok(());
             }
             self.colour_pair_pending = self.preview_updated == updated;
+        }
+        if socket_due && self.colour_preview {
+            self.socket_pacer.cost += preview_started.elapsed();
         }
         let (y, c) = pixels.split_at(WIDTH * HEIGHT);
         if self.monitor {
@@ -1513,15 +1574,19 @@ impl Output {
             self.checkpoint = std::time::Instant::now();
         }
         if self.socket.is_some() && !self.colour_preview {
-            // Real-time luma preview while recording, one packet per field.
-            let field = self.luma_field(&pixels, seq as u64, first);
-            self.send_preview(&crate::preview::sized_field_packet(
-                field.width,
-                field.height,
-                seq as u64,
-                first,
-                &field.pixels,
-            ))?;
+            // Real-time luma preview while recording, paced like the colour one.
+            if socket_due {
+                let started = std::time::Instant::now();
+                let field = self.luma_field(&pixels, seq as u64, first);
+                self.send_preview(&crate::preview::sized_field_packet(
+                    field.width,
+                    field.height,
+                    seq as u64,
+                    first,
+                    &field.pixels,
+                ))?;
+                self.socket_pacer.cost += started.elapsed();
+            }
         } else if let Some(path) = self.preview.as_ref().filter(|_| !self.colour_preview) {
             if self
                 .preview_updated
@@ -1601,25 +1666,32 @@ fn preview_field_full(
     }
 }
 fn preview_field(y: &[u16], field: u64, first: bool) -> crate::preview::PreviewFrame {
-    let mut pixels = Vec::with_capacity(crate::preview::WIDTH * crate::preview::HEIGHT);
-    for row in 0..crate::preview::HEIGHT {
-        let row = row + 22;
-        for x in 0..crate::preview::WIDTH {
-            let sx = 185.0 + (x as f32 + 0.5) * 922.0 / crate::preview::WIDTH as f32 - 0.5;
-            let i = sx as usize;
-            let tx = sx - i as f32;
-            let sample = |r: usize| {
-                cubic(
-                    y[r * WIDTH + i - 1] as f32,
-                    y[r * WIDTH + i] as f32,
-                    y[r * WIDTH + i + 1] as f32,
-                    y[r * WIDTH + i + 2] as f32,
-                    tx,
-                )
-            };
-            pixels.push(crate::preview::gray(sample(row)));
+    let mut pixels = vec![0; crate::preview::WIDTH * crate::preview::HEIGHT];
+    // Rows are scaled on all cores; this runs on the decode thread while recording.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let rows = crate::preview::HEIGHT.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (chunk, out) in pixels.chunks_mut(rows * crate::preview::WIDTH).enumerate() {
+            scope.spawn(move || {
+                for (i, out) in out.chunks_mut(crate::preview::WIDTH).enumerate() {
+                    let line = &y[(chunk * rows + i + 22) * WIDTH..][..WIDTH];
+                    for (x, pixel) in out.iter_mut().enumerate() {
+                        let sx =
+                            185.0 + (x as f32 + 0.5) * 922.0 / crate::preview::WIDTH as f32 - 0.5;
+                        let i = sx as usize;
+                        let tx = sx - i as f32;
+                        *pixel = crate::preview::gray(cubic(
+                            line[i - 1] as f32,
+                            line[i] as f32,
+                            line[i + 1] as f32,
+                            line[i + 2] as f32,
+                            tx,
+                        ));
+                    }
+                }
+            });
         }
-    }
+    });
     crate::preview::PreviewFrame {
         width: crate::preview::WIDTH,
         height: crate::preview::HEIGHT,
@@ -1861,7 +1933,7 @@ pub fn decode(args: &[String]) -> Result<(), String> {
         None
     };
     let started = std::time::Instant::now();
-    let fft = Fft::new(false);
+    let fft = Fft::new();
     let mut pipeline = if gpu {
         Some(if monitor && !colour_preview && !full_raster {
             crate::gpu::Pipeline::new_monitor(fs)?
@@ -2005,10 +2077,12 @@ pub fn decode(args: &[String]) -> Result<(), String> {
         },
         fs / 1e6
     );
+    // CPU blocks are independent, so a batch demodulates one block per core.
+    let cpu_blocks = std::thread::available_parallelism().map_or(1, |n| n.get());
     let batch_samples = if gpu {
         pipeline.as_ref().unwrap().batch_samples()
     } else {
-        N
+        cpu_blocks * HOP + 2 * EDGE
     };
     let mut raw = Vec::new();
     let mut absolute = 0;
@@ -2030,7 +2104,7 @@ pub fn decode(args: &[String]) -> Result<(), String> {
                 return Err("RF contains NaN/Inf samples".into());
             }
             let demod_started = std::time::Instant::now();
-            let blocks = if gpu { (raw.len() - 2 * EDGE) / HOP } else { 1 };
+            let blocks = (raw.len() - 2 * EDGE) / HOP;
             let consumed = blocks * HOP;
             if let Some(pipeline) = &mut pipeline {
                 if data.len() + consumed > pipeline.capacity() {
@@ -2041,16 +2115,32 @@ pub fn decode(args: &[String]) -> Result<(), String> {
                 }
                 *data.resident_len.as_mut().unwrap() += consumed;
             } else {
-                let block = if monitor && !colour_preview {
-                    demod_mode(&raw, fs, &fft, absolute, true)?
-                } else {
-                    demod(&raw, fs, &fft, absolute)?
-                };
-                pulses.push(&block.sync, block.base, fs);
-                data.luma.extend(block.luma);
-                data.envelope.extend(block.envelope);
-                data.sync.extend(block.sync);
-                data.chroma.extend(block.chroma);
+                let luma_only = monitor && !colour_preview;
+                let decoded: Vec<_> = std::thread::scope(|scope| {
+                    let workers: Vec<_> = (0..blocks)
+                        .map(|block| {
+                            let (raw, fft) = (&raw[block * HOP..block * HOP + N], &fft);
+                            let absolute = absolute + (block * HOP) as u64;
+                            scope.spawn(move || demod_mode(raw, fs, fft, absolute, luma_only))
+                        })
+                        .collect();
+                    workers
+                        .into_iter()
+                        .map(|worker| {
+                            worker
+                                .join()
+                                .map_err(|_| "Demodulation thread panicked".to_string())?
+                        })
+                        .collect()
+                });
+                for block in decoded {
+                    let block = block?;
+                    pulses.push(&block.sync, block.base, fs);
+                    data.luma.extend(block.luma);
+                    data.envelope.extend(block.envelope);
+                    data.sync.extend(block.sync);
+                    data.chroma.extend(block.chroma);
+                }
             }
             pulses.maintain_field_clock(data.base + data.len() as u64, fs);
             demod_time += demod_started.elapsed();
@@ -2381,7 +2471,7 @@ mod tests {
                 (phase.cos() + 0.04 * (std::f64::consts::TAU * UNDER * t).cos()) as f32
             })
             .collect();
-        let decoded = demod(&raw, fs, &Fft::new(false), 0).unwrap();
+        let decoded = demod(&raw, fs, &Fft::new(), 0).unwrap();
         let mut finder = PulseFinder::default();
         finder.push(&decoded.sync, decoded.base, fs);
         assert!(
@@ -2497,7 +2587,7 @@ mod tests {
             let mut source = Source::open(Path::new(&path), "auto").unwrap();
             source.skip((second as f64 * fs) as u64).unwrap();
             let mut raw = source.read(N).unwrap();
-            let fft = Fft::new(false);
+            let fft = Fft::new();
             let mut sync = Vec::new();
             for block in 0..120 {
                 let d = demod(&raw, fs, &fft, (block * HOP) as u64).unwrap();
@@ -2539,7 +2629,7 @@ mod tests {
         let path = std::env::var("VHS_RF_PROBE").expect("VHS_RF_PROBE");
         let mut source = Source::open(Path::new(&path), "auto").unwrap();
         let fs = 315e6 / 11.0;
-        let fft = Fft::new(false);
+        let fft = Fft::new();
         let mut raw = source.read(N).unwrap();
         let mut sync = Vec::new();
         let mut luma = Vec::new();
@@ -2642,7 +2732,7 @@ mod tests {
                 let expected = demod(
                     &raw[block * HOP..block * HOP + N],
                     fs,
-                    &Fft::new(false),
+                    &Fft::new(),
                     absolute + (block * HOP) as u64,
                 )
                 .unwrap();
@@ -2755,7 +2845,7 @@ mod tests {
     }
     #[test]
     fn cpu_fft_roundtrip_and_spectral_peak() {
-        let fft = Fft::new(false);
+        let fft = Fft::new();
         let original: Vec<_> = (0..N)
             .map(|i| C {
                 re: (std::f32::consts::TAU * 123.0 * i as f32 / N as f32).cos(),
