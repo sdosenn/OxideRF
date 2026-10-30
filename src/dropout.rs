@@ -123,27 +123,61 @@ fn smooth_envelope(input: &[f32], fs: f64) -> Vec<f32> {
     let k = (std::f64::consts::PI * 700_000.0 / fs).tan() as f32;
     let b = k / (1.0 + k);
     let a = (k - 1.0) / (k + 1.0);
-    let mut result: Vec<_> = input
+    let clean: Vec<_> = input
         .iter()
         .map(|v| if v.is_finite() { v.max(0.0) } else { 0.0 })
         .collect();
-    let mut previous_input = result[0];
-    let mut previous_output = previous_input;
-    for value in &mut result {
-        let current = *value;
-        *value = b * (current + previous_input) - a * previous_output;
-        previous_input = current;
-        previous_output = *value;
-    }
-    previous_input = *result.last().unwrap();
-    previous_output = previous_input;
-    for value in result.iter_mut().rev() {
-        let current = *value;
-        *value = b * (current + previous_input) - a * previous_output;
-        previous_input = current;
-        previous_output = *value;
-    }
-    result
+    let forward = smooth_pass(&clean, b, a, false);
+    smooth_pass(&forward, b, a, true)
+}
+
+/// Samples a chunk's filter state runs through before its first output. The
+/// pole is about -0.86 at 28.6 MHz, so an arbitrary start state decays below
+/// f32 precision long before this and the chunks join the serial result.
+const WARMUP: usize = 512;
+
+/// One direction of the first-order filter, split into chunks filtered on all
+/// cores. A field envelope is over half a million samples, and the serial
+/// recursion otherwise dominates dropout detection.
+fn smooth_pass(x: &[f32], b: f32, a: f32, reverse: bool) -> Vec<f32> {
+    let n = x.len();
+    let mut y = vec![0.0; n];
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let chunk = n.div_ceil(threads).max(4 * WARMUP);
+    let step = |state: &mut (f32, f32), current: f32| {
+        let value = b * (current + state.0) - a * state.1;
+        *state = (current, value);
+        value
+    };
+    std::thread::scope(|scope| {
+        for (index, out) in y.chunks_mut(chunk).enumerate() {
+            let begin = index * chunk;
+            let end = begin + out.len();
+            scope.spawn(move || {
+                // At either end of the field the start state equals the serial filter's.
+                if reverse {
+                    let from = (end + WARMUP).min(n);
+                    let mut state = (x[from - 1], x[from - 1]);
+                    for &value in x[end..from].iter().rev() {
+                        step(&mut state, value);
+                    }
+                    for (out, &value) in out.iter_mut().zip(&x[begin..end]).rev() {
+                        *out = step(&mut state, value);
+                    }
+                } else {
+                    let from = begin.saturating_sub(WARMUP);
+                    let mut state = (x[from], x[from]);
+                    for &value in &x[from..begin] {
+                        step(&mut state, value);
+                    }
+                    for (out, &value) in out.iter_mut().zip(&x[begin..end]) {
+                        *out = step(&mut state, value);
+                    }
+                }
+            });
+        }
+    });
+    y
 }
 
 pub fn repair(pixels: &mut [u16], map: &Map) -> usize {
@@ -252,5 +286,40 @@ mod tests {
         assert_eq!(pixels[PLANE + 101 * WIDTH + 200], 31000);
         assert_eq!(pixels[100 * WIDTH + 200], 99);
         assert_eq!(pixels[50 * WIDTH + 200], old[50 * WIDTH + 200]);
+    }
+    #[test]
+    fn chunked_smoothing_matches_the_serial_filter_exactly() {
+        let fs = 28_636_363.0;
+        // A field's worth of noisy RF envelope with deep dips.
+        let mut seed = 1u32;
+        let input: Vec<f32> = (0..572_000)
+            .map(|i| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = (seed >> 8) as f32 / (1u32 << 24) as f32;
+                if i % 9000 < 40 {
+                    0.02 * noise
+                } else {
+                    0.5 + noise
+                }
+            })
+            .collect();
+        let k = (std::f64::consts::PI * 700_000.0 / fs).tan() as f32;
+        let (b, a) = (k / (1.0 + k), (k - 1.0) / (k + 1.0));
+        let serial = |x: &[f32], reverse: bool| {
+            let mut y = vec![0.0; x.len()];
+            let order: Vec<usize> = if reverse {
+                (0..x.len()).rev().collect()
+            } else {
+                (0..x.len()).collect()
+            };
+            let mut state = (x[order[0]], x[order[0]]);
+            for i in order {
+                y[i] = b * (x[i] + state.0) - a * state.1;
+                state = (x[i], y[i]);
+            }
+            y
+        };
+        let expected = serial(&serial(&input, false), true);
+        assert_eq!(smooth_envelope(&input, fs), expected);
     }
 }

@@ -1230,20 +1230,19 @@ impl Output {
             }
             locations.push(position);
         }
+        // On the GPU both refinements, and the dropout envelope, take one round trip.
+        let mut envelope = None;
         if let Some(pipeline) = gpu.as_deref_mut() {
-            let levels = pipeline.refine(&mut locations, &mut locked)?;
-            for row in 22..300 {
-                if locked[row] {
-                    tips.push(levels[row].0);
-                    porches.push(levels[row].1);
-                }
+            let refined = pipeline.refine_field(&mut locations, &mut locked, self.dropouts)?;
+            for &(tip, porch) in refined.levels[22..300].iter().flatten() {
+                tips.push(tip);
+                porches.push(porch);
             }
+            envelope = refined.envelope;
         }
-        if tips.len() > 100 && porches.len() > 100 {
+        if gpu.is_none() && tips.len() > 100 && porches.len() > 100 {
             let threshold = (median(&mut tips) + median(&mut porches)) * 0.5;
-            if let Some(pipeline) = gpu.as_deref_mut() {
-                pipeline.refine_at_level(&mut locations, &mut locked, threshold)?;
-            } else {
+            {
                 for (position, valid) in locations.iter_mut().zip(&mut locked) {
                     if *valid {
                         if let Some(refined) = refine_hsync_at_level(
@@ -1290,11 +1289,36 @@ impl Output {
             return Err("Not enough samples for a complete field".into());
         }
         let seq = self.count + 1;
+        let mut queued = None;
         let dropout_map = if self.dropouts {
             let map = if let Some(pipeline) = gpu.as_deref_mut() {
-                let map = pipeline.dropout_map(&locations, self.dropout_threshold)?;
-                pipeline.set_dropout_mask(&map)?;
-                map
+                let start = locations[0].floor() as u64;
+                let end = locations[HEIGHT].ceil() as u64;
+                let read = envelope
+                    .as_ref()
+                    .filter(|(at, env)| *at <= start && end <= at + env.len() as u64);
+                if let Some((at, env)) = read {
+                    // While recording, the GPU renders the field during detection
+                    // and applies the mask when it is read back.
+                    if !self.monitor {
+                        queued = Some(pipeline.begin_field(&locations, &locked, blank)?);
+                    }
+                    let map = crate::dropout::detect(
+                        &env[(start - at) as usize..(end - at) as usize],
+                        start,
+                        &locations,
+                        fs,
+                        self.dropout_threshold,
+                    );
+                    if queued.is_none() {
+                        pipeline.set_dropout_mask(&map)?;
+                    }
+                    map
+                } else {
+                    let map = pipeline.dropout_map(&locations, self.dropout_threshold)?;
+                    pipeline.set_dropout_mask(&map)?;
+                    map
+                }
             } else {
                 let start = locations[0].floor() as u64;
                 let begin = (start - data.base) as usize;
@@ -1400,7 +1424,11 @@ impl Output {
             }
         }
         let mut pixels = if let Some(pipeline) = gpu.as_deref_mut() {
-            pipeline.field(&locations, &locked, blank)?
+            if let Some(upload) = queued.take() {
+                pipeline.finish_field(upload, dropout_map.as_ref())?
+            } else {
+                pipeline.field(&locations, &locked, blank)?
+            }
         } else {
             let mut bursts: Vec<(f64, f32)> = (0..HEIGHT)
                 .map(|row| {

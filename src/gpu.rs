@@ -21,6 +21,22 @@ impl Drop for UploadFence {
     }
 }
 
+/// Result of [`Pipeline::refine_field`].
+pub(crate) struct RefinedField {
+    /// First-pass tip and porch levels of each line still locked after it.
+    pub levels: Vec<Option<(f32, f32)>>,
+    /// Absolute first sample and RF envelope covering the refined field.
+    pub envelope: Option<(u64, Vec<f32>)>,
+}
+
+/// Host line data borrowed by a field queued with [`Pipeline::begin_field`].
+pub(crate) struct FieldUpload {
+    // Declared first: dropping drains the queue before the data is freed.
+    fence: UploadFence,
+    _origins: Vec<u32>,
+    _lines: Vec<f32>,
+}
+
 pub(crate) struct Pipeline {
     _pq: ProQue,
     mask: u32,
@@ -40,12 +56,16 @@ pub(crate) struct Pipeline {
     origins: Buffer<u32>,
     lines: Buffer<f32>,
     refined: Buffer<f32>,
+    refined_at: Buffer<f32>,
+    threshold: Buffer<f32>,
     output: Buffer<u16>,
     pack: Kernel,
     demod: Vec<(Kernel, usize)>,
     store: Kernel,
     pulses: Kernel,
     refine: Kernel,
+    refine_threshold: Kernel,
+    refine_at: Kernel,
     burst: Kernel,
     tbc: Kernel,
     chroma_state: Kernel,
@@ -142,6 +162,8 @@ impl Pipeline {
         let lines = buffer::<f32>(&pq, (HEIGHT + 1) * 4)?;
         let sinc_lut = upload(&pq, crate::resample::table())?;
         let refined = buffer::<f32>(&pq, (HEIGHT + 1) * 4)?;
+        let refined_at = buffer::<f32>(&pq, (HEIGHT + 1) * 4)?;
+        let threshold = buffer::<f32>(&pq, 3)?;
         let row_burst = buffer::<f32>(&pq, HEIGHT * 4)?;
         let output = buffer::<u16>(&pq, WIDTH * HEIGHT * 2)?;
         let mut tw = Vec::with_capacity(N);
@@ -295,6 +317,23 @@ impl Pipeline {
             .arg(&refined)
             .arg(0.0f32)
             .build()?;
+        let refine_threshold = pq
+            .kernel_builder("refine_threshold")
+            .global_work_size(278)
+            .arg(&refined)
+            .arg(&threshold)
+            .build()?;
+        let refine_at = pq
+            .kernel_builder("refine_lines_at")
+            .global_work_size(HEIGHT + 1)
+            .arg(&ring)
+            .arg(mask)
+            .arg(&origins)
+            .arg(&refined)
+            .arg((fs / 1e6) as f32)
+            .arg(&refined_at)
+            .arg(&threshold)
+            .build()?;
         let burst = pq
             .kernel_builder("burst_rows")
             .global_work_size(HEIGHT)
@@ -393,12 +432,16 @@ impl Pipeline {
             origins,
             lines,
             refined,
+            refined_at,
+            threshold,
             output,
             pack,
             demod,
             store,
             pulses,
             refine,
+            refine_threshold,
+            refine_at,
             burst,
             tbc,
             chroma_state,
@@ -573,14 +616,7 @@ impl Pipeline {
         uploads.pending = false;
         Ok(result)
     }
-    pub(crate) fn refine(
-        &mut self,
-        locations: &mut [f64],
-        locked: &mut [bool],
-    ) -> Result<Vec<(f32, f32)>, String> {
-        self.refine_inner(locations, locked, 0.0)
-            .map_err(|e| e.to_string())
-    }
+    #[cfg(test)]
     pub(crate) fn refine_at_level(
         &mut self,
         locations: &mut [f64],
@@ -590,6 +626,7 @@ impl Pipeline {
         self.refine_inner(locations, locked, threshold)
             .map_err(|e| e.to_string())
     }
+    #[cfg(test)]
     fn refine_inner(
         &mut self,
         locations: &mut [f64],
@@ -625,6 +662,162 @@ impl Pipeline {
             .iter()
             .map(|v| (v[1], v[2]))
             .collect())
+    }
+    /// Both sync refinements and, for dropout detection, the field's RF
+    /// envelope in a single GPU round trip. The field threshold between the
+    /// passes is computed on the GPU. Returns the first pass's tip and porch
+    /// levels and, when requested, the envelope from `envelope.0`.
+    pub(crate) fn refine_field(
+        &mut self,
+        locations: &mut [f64],
+        locked: &mut [bool],
+        envelope: bool,
+    ) -> Result<RefinedField, String> {
+        self.refine_field_inner(locations, locked, envelope)
+            .map_err(|e| e.to_string())
+    }
+    fn refine_field_inner(
+        &mut self,
+        locations: &mut [f64],
+        locked: &mut [bool],
+        envelope: bool,
+    ) -> ocl::Result<RefinedField> {
+        self.refine.set_arg(6, 0.0f32)?;
+        let origins: Vec<_> = locations
+            .iter()
+            .map(|p| (*p as u64 as u32) & self.mask)
+            .collect();
+        let lines: Vec<_> = locations
+            .iter()
+            .zip(locked.iter())
+            .flat_map(|(p, locked)| [p.fract() as f32, 0.0, if *locked { 1.0 } else { 0.0 }, 0.0])
+            .collect();
+        // Refinement moves syncs by a few microseconds; a margin around the
+        // predicted field keeps the final envelope range inside this read.
+        let margin = (self.fs * 100e-6) as u64;
+        let range = envelope.then(|| {
+            let start = (locations[0].floor() as u64).saturating_sub(margin);
+            let count = (locations[HEIGHT].ceil() as u64 + margin - start) as usize;
+            (start, count.min(self.capacity()))
+        });
+        let mut first = vec![0f32; locations.len() * 4];
+        let mut second = vec![0f32; locations.len() * 4];
+        let mut threshold = [0f32; 3];
+        let mut env = vec![0f32; range.map_or(0, |r| r.1)];
+        let mut fence = UploadFence {
+            queue: self._pq.queue().clone(),
+            pending: true,
+        };
+        // All borrowed host slices outlive the final blocking read and the fence.
+        unsafe {
+            self.origins.write(&origins).block(false).enq()?;
+            self.lines.write(&lines).block(false).enq()?;
+            self.refine.enq()?;
+            self.refine_threshold.enq()?;
+            self.refine_at.enq()?;
+            if let Some((start, count)) = range {
+                let at = (start as u32 & self.mask) as usize;
+                let split = count.min(self.capacity() - at);
+                self.envelope
+                    .read(&mut env[..split])
+                    .offset(at)
+                    .block(false)
+                    .enq()?;
+                if split < count {
+                    self.envelope
+                        .read(&mut env[split..])
+                        .offset(0)
+                        .block(false)
+                        .enq()?;
+                }
+            }
+            self.refined.read(&mut first).block(false).enq()?;
+            self.threshold.read(&mut threshold[..]).block(false).enq()?;
+        }
+        self.refined_at.read(&mut second).enq()?;
+        fence.pending = false;
+        let apply = |locations: &mut [f64], locked: &mut [bool], result: &[f32]| {
+            for ((p, valid), row) in locations
+                .iter_mut()
+                .zip(locked.iter_mut())
+                .zip(result.as_chunks::<4>().0)
+            {
+                *p = p.floor() + row[0] as f64;
+                *valid &= row[3] > 0.0;
+            }
+        };
+        apply(locations, locked, &first);
+        let levels = first
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(locked.iter())
+            .map(|(v, locked)| locked.then_some((v[1], v[2])))
+            .collect();
+        // The CPU path also needs more than 100 locked rows for a field threshold.
+        if threshold[2] > 100.0 {
+            apply(locations, locked, &second);
+        }
+        Ok(RefinedField {
+            levels,
+            envelope: range.map(|(start, _)| (start, env)),
+        })
+    }
+    /// Upload the field's lines and queue TBC rendering without waiting, so
+    /// the GPU renders while the host detects dropouts. Finish with
+    /// [`Self::finish_field`].
+    pub(crate) fn begin_field(
+        &self,
+        locations: &[f64],
+        locked: &[bool],
+        blank: f32,
+    ) -> Result<FieldUpload, String> {
+        let run = || -> ocl::Result<FieldUpload> {
+            let (origins, lines) = self.field_lines(locations, locked);
+            let upload = FieldUpload {
+                fence: UploadFence {
+                    queue: self._pq.queue().clone(),
+                    pending: true,
+                },
+                _origins: origins,
+                _lines: lines,
+            };
+            // The upload owns the host data until finish_field's blocking read.
+            unsafe {
+                self.origins.write(&upload._origins).block(false).enq()?;
+                self.lines.write(&upload._lines).block(false).enq()?;
+            }
+            self.tbc.set_arg(5, blank)?;
+            self.render_kernels()?;
+            self._pq.queue().flush()?;
+            Ok(upload)
+        };
+        run().map_err(|e| e.to_string())
+    }
+    /// Apply the dropout mask, if any, and read the field queued by
+    /// [`Self::begin_field`].
+    pub(crate) fn finish_field(
+        &self,
+        mut upload: FieldUpload,
+        dropouts: Option<&crate::dropout::Map>,
+    ) -> Result<Vec<u16>, String> {
+        let run = || -> ocl::Result<Vec<u16>> {
+            if let (Some(map), Some((mask, _, _))) = (dropouts, &self.dropout_repair) {
+                // The map outlives the blocking read below.
+                unsafe {
+                    mask.write(&map.mask).block(false).enq()?;
+                }
+            }
+            if dropouts.is_some() {
+                self.correct_tbc()?;
+            }
+            let mut pixels = vec![0u16; WIDTH * HEIGHT * 2];
+            self.output.read(&mut pixels).enq()?;
+            Ok(pixels)
+        };
+        let pixels = run().map_err(|e| e.to_string())?;
+        upload.fence.pending = false;
+        Ok(pixels)
     }
     pub(crate) fn field(
         &mut self,
@@ -684,6 +877,11 @@ impl Pipeline {
     fn render_tbc(&self, locations: &[f64], locked: &[bool], blank: f32) -> ocl::Result<()> {
         self.upload_field_lines(locations, locked)?;
         self.tbc.set_arg(5, blank)?;
+        self.render_kernels()?;
+        self.correct_tbc()?;
+        Ok(())
+    }
+    fn render_kernels(&self) -> ocl::Result<()> {
         unsafe {
             self.burst.enq()?;
             self.chroma_state.enq()?;
@@ -691,7 +889,6 @@ impl Pipeline {
             self.smooth_gain.enq()?;
             self.tbc.enq()?;
         }
-        self.correct_tbc()?;
         Ok(())
     }
     fn correct_tbc(&self) -> ocl::Result<()> {
@@ -731,6 +928,12 @@ impl Pipeline {
             .map_err(|e| e.to_string())
     }
     fn upload_field_lines(&self, locations: &[f64], locked: &[bool]) -> ocl::Result<()> {
+        let (origins, lines) = self.field_lines(locations, locked);
+        self.origins.write(&origins).enq()?;
+        self.lines.write(&lines).enq()?;
+        Ok(())
+    }
+    fn field_lines(&self, locations: &[f64], locked: &[bool]) -> (Vec<u32>, Vec<f32>) {
         let origins: Vec<_> = locations
             .iter()
             .map(|p| (*p as u64 as u32) & self.mask)
@@ -751,9 +954,7 @@ impl Pipeline {
                 ]
             })
             .collect();
-        self.origins.write(&origins).enq()?;
-        self.lines.write(&lines).enq()?;
-        Ok(())
+        (origins, lines)
     }
     pub(crate) fn preview(
         &mut self,

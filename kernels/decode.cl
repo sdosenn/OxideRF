@@ -136,12 +136,8 @@ float median8(float *v) {
 }
 // Coordinates stay relative to a single line to preserve subpixel precision
 // with FP32 even when a recording contains billions of RF samples.
-__kernel void refine_lines(__global const float4 *ring, uint mask,
-                            __global const uint *origins, __global const float4 *lines,
-                            float samples_per_us, __global float4 *result, float threshold) {
-    uint row=get_global_id(0), origin=origins[row];
-    float edge=lines[row].x;
-    if (lines[row].z == 0.0f) { result[row]=(float4)(edge,0,0,0); return; }
+float4 refine_row(__global const float4 *ring, uint mask, uint origin, float edge,
+                  float samples_per_us, float threshold) {
     float tips[8], porches[8],tip=0.0f,porch=0.0f,best=edge;
     float valid=0.0f;
     for(uint pass=0;pass<2;++pass) {
@@ -185,7 +181,50 @@ __kernel void refine_lines(__global const float4 *ring, uint mask,
         tips[i]=sample_ring(ring,mask,origin,best+(0.8f+i*0.18f)*samples_per_us).y;
         porches[i]=sample_ring(ring,mask,origin,best+(6.8f+i*0.2f)*samples_per_us).y;
     }
-    result[row]=(float4)(best,median8(tips),median8(porches),valid);
+    return (float4)(best,median8(tips),median8(porches),valid);
+}
+__kernel void refine_lines(__global const float4 *ring, uint mask,
+                            __global const uint *origins, __global const float4 *lines,
+                            float samples_per_us, __global float4 *result, float threshold) {
+    uint row=get_global_id(0);
+    float edge=lines[row].x;
+    if (lines[row].z == 0.0f) { result[row]=(float4)(edge,0,0,0); return; }
+    result[row]=refine_row(ring,mask,origins[row],edge,samples_per_us,threshold);
+}
+// Field-common sync threshold from the first refinement: the median tip and
+// porch levels over rows 22..299 still locked, as on the CPU. One work item per
+// row finds its rank; the rows ranked at the middle write the medians, and
+// item 0 writes the number of locked rows.
+__kernel void refine_threshold(__global const float4 *result, __global float *threshold) {
+    uint i=get_global_id(0);
+    float4 own=result[22+i];
+    uint n=0, tip_rank=0, porch_rank=0;
+    for (uint j=0; j<278; ++j) {
+        float4 other=result[22+j];
+        if (other.w > 0.0f) {
+            ++n;
+            if (other.y<own.y || (other.y==own.y && j<i)) ++tip_rank;
+            if (other.z<own.z || (other.z==own.z && j<i)) ++porch_rank;
+        }
+    }
+    if (i == 0) threshold[2]=(float)n;
+    if (own.w > 0.0f) {
+        if (tip_rank == n/2) threshold[0]=own.y;
+        if (porch_rank == n/2) threshold[1]=own.z;
+    }
+}
+// Second refinement at the field threshold, starting from the first result
+// without a host round trip. Positions stay relative to each line's origin.
+__kernel void refine_lines_at(__global const float4 *ring, uint mask,
+                               __global const uint *origins, __global const float4 *first,
+                               float samples_per_us, __global float4 *result,
+                               __global const float *threshold) {
+    uint row=get_global_id(0);
+    float4 previous=first[row];
+    float whole=floor(previous.x), edge=previous.x-whole;
+    if (previous.w == 0.0f) { result[row]=(float4)(edge,0,0,0); return; }
+    float level=(threshold[0]+threshold[1])*0.5f;
+    result[row]=refine_row(ring,mask,origins[row]+(uint)(int)whole,edge,samples_per_us,level);
 }
 __kernel void burst_rows(__global const float4 *ring, uint mask,
                           __global const uint *origins, __global const float4 *lines,
