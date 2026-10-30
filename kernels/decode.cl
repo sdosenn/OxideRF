@@ -261,6 +261,113 @@ __kernel void smooth_backward(__global const float *in, uint count, float b, flo
         if (k-1<end) out[k-1]=value;
     }
 }
+// Dropout threshold and intervals on the smoothed envelope, as
+// dropout::raw_intervals. One work-group of 256 finds the median of every
+// 32nd positive level exactly with a radix select: positive floats order
+// like their bit patterns. It stores the median and the number of levels.
+__kernel void dropout_median(__global const float *smoothed, uint count,
+                             __global float *level, __local uint *hist) {
+    __local uint total, chosen, remaining;
+    uint lid=get_local_id(0), size=get_local_size(0), m=(count+31u)/32u;
+    if (lid==0) total=0;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    uint mine=0;
+    for (uint j=lid; j<m; j+=size) {
+        float v=smoothed[j*32u];
+        if (isfinite(v) && v>0.0f) ++mine;
+    }
+    atomic_add(&total,mine);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    uint n=total;
+    if (n<32u) { if (lid==0) level[1]=(float)n; return; }
+    uint prefix=0, k=n/2u;
+    for (int shift=24; shift>=0; shift-=8) {
+        uint high=shift==24 ? 0u : 0xffffffffu<<(shift+8);
+        hist[lid]=0;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (uint j=lid; j<m; j+=size) {
+            float v=smoothed[j*32u];
+            uint bits=as_uint(v);
+            if (isfinite(v) && v>0.0f && (bits&high)==(prefix&high))
+                atomic_inc(&hist[(bits>>shift)&255u]);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (lid==0) {
+            uint below=0, bucket=0;
+            while (below+hist[bucket]<=k) { below+=hist[bucket]; ++bucket; }
+            chosen=prefix|(bucket<<shift);
+            remaining=k-below;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        prefix=chosen; k=remaining;
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid==0) { level[0]=as_float(prefix); level[1]=(float)n; }
+}
+#define DROPOUT_CHUNK 256u
+// 0: no low or recovered sample, 1: last decisive sample low, 2: recovered.
+uint dropout_class(float v, float threshold) {
+    if (!isfinite(v) || v<=threshold) return 1u;
+    return v>=threshold*1.25f ? 2u : 0u;
+}
+__kernel void dropout_chunks(__global const float *smoothed, uint count,
+                             __global const float *level, float fraction,
+                             __global uint *state) {
+    uint chunk=get_global_id(0), begin=chunk*DROPOUT_CHUNK;
+    if (begin>=count) return;
+    float threshold=level[0]*fraction;
+    uint last=0, end=min(begin+DROPOUT_CHUNK,count);
+    for (uint k=begin; k<end; ++k) {
+        uint c=dropout_class(smoothed[k],threshold);
+        if (c) last=c;
+    }
+    state[chunk]=last;
+}
+// One work-group turns per-chunk states into each chunk's entry state:
+// whether the scan is inside a dropout when it reaches the chunk.
+__kernel void dropout_entries(__global const uint *state, uint chunks,
+                              __global uint *entry, __local uint *scan) {
+    uint lid=get_local_id(0), size=get_local_size(0);
+    uint per=(chunks+size-1u)/size, first=lid*per, end=min(first+per,chunks);
+    uint last=0;
+    for (uint c=first; c<end; ++c) if (state[c]) last=state[c];
+    scan[lid]=last;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint offset=1; offset<size; offset<<=1) {
+        uint v=lid>=offset ? scan[lid-offset] : 0u;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (scan[lid]==0u) scan[lid]=v;
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    uint inside=lid>0 && scan[lid-1]==1u;
+    for (uint c=first; c<end; ++c) {
+        entry[c]=inside;
+        if (state[c]) inside=state[c]==1u;
+    }
+}
+// Boundary events: the sample index where a dropout starts, or with the top
+// bit set where the level recovers. Order is restored on the host.
+__kernel void dropout_events(__global const float *smoothed, uint count,
+                             __global const float *level, float fraction,
+                             __global const uint *entry, __global uint *events,
+                             volatile __global uint *total, uint capacity) {
+    uint chunk=get_global_id(0), begin=chunk*DROPOUT_CHUNK;
+    if (begin>=count || level[1]<32.0f) return;
+    float threshold=level[0]*fraction;
+    uint inside=entry[chunk], end=min(begin+DROPOUT_CHUNK,count);
+    for (uint k=begin; k<end; ++k) {
+        uint c=dropout_class(smoothed[k],threshold);
+        if (c==1u && !inside) {
+            uint at=atomic_inc(total);
+            if (at<capacity) events[at]=k;
+            inside=1u;
+        } else if (c==2u && inside) {
+            uint at=atomic_inc(total);
+            if (at<capacity) events[at]=k|0x80000000u;
+            inside=0u;
+        }
+    }
+}
 __kernel void burst_rows(__global const float4 *ring, uint mask,
                           __global const uint *origins, __global const float4 *lines,
                           __global float4 *burst) {

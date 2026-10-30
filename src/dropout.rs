@@ -57,7 +57,13 @@ pub fn detect_smoothed(
     fs: f64,
     fraction: f32,
 ) -> Map {
-    let mut map = Map::empty();
+    map_intervals(raw_intervals(envelope, fraction), base, locations, fs)
+}
+
+/// Samples below `fraction` of the field's median smoothed RF level, until
+/// the level recovers to 1.25 times that threshold. Matches the OpenCL
+/// `dropout_*` kernels.
+pub fn raw_intervals(envelope: &[f32], fraction: f32) -> Vec<(usize, usize)> {
     let mut levels: Vec<f32> = envelope
         .iter()
         .step_by(32)
@@ -65,13 +71,11 @@ pub fn detect_smoothed(
         .filter(|v| v.is_finite() && *v > 0.0)
         .collect();
     if levels.len() < 32 || envelope.is_empty() {
-        return map;
+        return Vec::new();
     }
     let middle = levels.len() / 2;
     levels.select_nth_unstable_by(middle, f32::total_cmp);
     let threshold = levels[middle] * fraction;
-    let minimum = (fs * 0.35e-6).ceil() as usize;
-    let merge = (fs * 1.05e-6).ceil() as usize;
     let mut intervals: Vec<(usize, usize)> = Vec::new();
     let mut start = None;
     for (i, &level) in envelope.iter().enumerate() {
@@ -86,6 +90,37 @@ pub fn detect_smoothed(
     if let Some(a) = start {
         intervals.push((a, envelope.len()));
     }
+    intervals
+}
+
+/// Intervals from the OpenCL boundary events: sample indices, with the top
+/// bit set on the sample where the level recovered.
+pub fn event_intervals(events: &mut [u32], len: usize) -> Vec<(usize, usize)> {
+    events.sort_unstable_by_key(|e| e & !END);
+    let mut intervals = Vec::new();
+    let mut start = None;
+    for &event in events.iter() {
+        let at = (event & !END) as usize;
+        if event & END == 0 {
+            start = Some(at);
+        } else if let Some(a) = start.take() {
+            intervals.push((a, at));
+        }
+    }
+    if let Some(a) = start {
+        intervals.push((a, len));
+    }
+    intervals
+}
+/// Marks an OpenCL event as the end of an interval.
+pub const END: u32 = 1 << 31;
+
+/// Picture mask and spans of raw dropout intervals in a field envelope that
+/// starts at absolute sample `base`.
+pub fn map_intervals(intervals: Vec<(usize, usize)>, base: u64, locations: &[f64], fs: f64) -> Map {
+    let mut map = Map::empty();
+    let minimum = (fs * 0.35e-6).ceil() as usize;
+    let merge = (fs * 1.05e-6).ceil() as usize;
     let mut joined: Vec<(usize, usize)> = Vec::new();
     // Reject brief dips before merging: otherwise a train of clean transitions
     // can join into a long false dropout across the counter of a letter.
@@ -130,7 +165,7 @@ pub fn detect_smoothed(
     map
 }
 
-fn smooth_envelope(input: &[f32], fs: f64) -> Vec<f32> {
+pub(crate) fn smooth_envelope(input: &[f32], fs: f64) -> Vec<f32> {
     if input.is_empty() {
         return Vec::new();
     }

@@ -35,14 +35,36 @@ pub(crate) struct FieldUpload {
     fence: UploadFence,
     _origins: Vec<u32>,
     _lines: Vec<f32>,
-    smoothed: Vec<f32>,
+    /// Envelope length and threshold fraction when dropouts are detected
+    /// with the field.
+    dropouts: Option<(usize, f32)>,
 }
-impl FieldUpload {
-    /// The field's smoothed dropout envelope, when one was requested.
-    pub(crate) fn smoothed(&self) -> &[f32] {
-        &self.smoothed
-    }
+
+/// Dropout detection kept on the GPU: envelope smoothing, the field's RF
+/// level and the interval boundaries, read back with the field.
+struct DropoutGpu {
+    forward: Kernel,
+    backward: Kernel,
+    median: Kernel,
+    chunks: Kernel,
+    entries: Kernel,
+    events: Kernel,
+    smoothed: Buffer<f32>,
+    level: Buffer<f32>,
+    event_list: Buffer<u32>,
+    event_count: Buffer<u32>,
+    _forward_out: Buffer<f32>,
+    _state: Buffer<u32>,
+    _entry: Buffer<u32>,
 }
+/// Raw dropout intervals as sample ranges of a field envelope.
+type Intervals = Vec<(usize, usize)>;
+/// Boundary events the GPU stores per field; fields with more fall back to
+/// detection on the host.
+const DROPOUT_EVENTS: usize = 65536;
+/// Events read back with every field; more need a second read.
+const DROPOUT_EVENTS_READ: usize = 4096;
+const DROPOUT_CHUNK: usize = 256;
 
 pub(crate) struct Pipeline {
     _pq: ProQue,
@@ -85,8 +107,7 @@ pub(crate) struct Pipeline {
     colour_preview: Option<crate::export::GpuPreview>,
     envelope: Buffer<f32>,
     dropout_repair: Option<(Buffer<u8>, Buffer<u16>, Kernel)>,
-    /// Forward/backward envelope smoothing kernels and their output buffers.
-    smoothing: Option<(Kernel, Kernel, Buffer<f32>, Buffer<f32>)>,
+    dropout_gpu: Option<DropoutGpu>,
     // Keep all backing allocations alive for cached kernel arguments.
     _work: Vec<Buffer<f32>>,
 }
@@ -463,7 +484,7 @@ impl Pipeline {
             colour_preview: None,
             envelope,
             dropout_repair: None,
-            smoothing: None,
+            dropout_gpu: None,
             _work: work,
         })
     }
@@ -488,42 +509,89 @@ impl Pipeline {
             self.store.set_arg(11, 1i32)?;
             let (b, a) = crate::dropout::smoothing(self.fs);
             let length = self.smoothing_capacity();
+            let chunks = length.div_ceil(DROPOUT_CHUNK);
             let forward_out = buffer::<f32>(&self._pq, length)?;
-            let backward_out = buffer::<f32>(&self._pq, length)?;
-            let forward = self
-                ._pq
-                .kernel_builder("smooth_forward")
-                .global_work_size(1)
-                .arg(&envelope)
-                .arg(self.mask)
-                .arg(0u32)
-                .arg(0u32)
-                .arg(b)
-                .arg(a)
-                .arg(&forward_out)
-                .build()?;
-            let backward = self
-                ._pq
-                .kernel_builder("smooth_backward")
-                .global_work_size(1)
-                .arg(&forward_out)
-                .arg(0u32)
-                .arg(b)
-                .arg(a)
-                .arg(&backward_out)
-                .build()?;
-            Ok::<_, ocl::Error>((
-                envelope,
-                mask,
-                output,
-                kernel,
-                (forward, backward, forward_out, backward_out),
-            ))
+            let smoothed = buffer::<f32>(&self._pq, length)?;
+            let level = buffer::<f32>(&self._pq, 2)?;
+            let state = buffer::<u32>(&self._pq, chunks)?;
+            let entry = buffer::<u32>(&self._pq, chunks)?;
+            let event_list = buffer::<u32>(&self._pq, DROPOUT_EVENTS)?;
+            let event_count = buffer::<u32>(&self._pq, 1)?;
+            let pq = &self._pq;
+            let gpu = DropoutGpu {
+                forward: pq
+                    .kernel_builder("smooth_forward")
+                    .global_work_size(1)
+                    .arg(&envelope)
+                    .arg(self.mask)
+                    .arg(0u32)
+                    .arg(0u32)
+                    .arg(b)
+                    .arg(a)
+                    .arg(&forward_out)
+                    .build()?,
+                backward: pq
+                    .kernel_builder("smooth_backward")
+                    .global_work_size(1)
+                    .arg(&forward_out)
+                    .arg(0u32)
+                    .arg(b)
+                    .arg(a)
+                    .arg(&smoothed)
+                    .build()?,
+                median: pq
+                    .kernel_builder("dropout_median")
+                    .global_work_size(256)
+                    .local_work_size(256)
+                    .arg(&smoothed)
+                    .arg(0u32)
+                    .arg(&level)
+                    .arg_local::<u32>(256)
+                    .build()?,
+                chunks: pq
+                    .kernel_builder("dropout_chunks")
+                    .global_work_size(1)
+                    .arg(&smoothed)
+                    .arg(0u32)
+                    .arg(&level)
+                    .arg(0f32)
+                    .arg(&state)
+                    .build()?,
+                entries: pq
+                    .kernel_builder("dropout_entries")
+                    .global_work_size(256)
+                    .local_work_size(256)
+                    .arg(&state)
+                    .arg(0u32)
+                    .arg(&entry)
+                    .arg_local::<u32>(256)
+                    .build()?,
+                events: pq
+                    .kernel_builder("dropout_events")
+                    .global_work_size(1)
+                    .arg(&smoothed)
+                    .arg(0u32)
+                    .arg(&level)
+                    .arg(0f32)
+                    .arg(&entry)
+                    .arg(&event_list)
+                    .arg(&event_count)
+                    .arg(DROPOUT_EVENTS as u32)
+                    .build()?,
+                smoothed,
+                level,
+                event_list,
+                event_count,
+                _forward_out: forward_out,
+                _state: state,
+                _entry: entry,
+            };
+            Ok::<_, ocl::Error>((envelope, mask, output, kernel, gpu))
         };
-        let (envelope, mask, output, kernel, smoothing) = run().map_err(|e| e.to_string())?;
+        let (envelope, mask, output, kernel, gpu) = run().map_err(|e| e.to_string())?;
         self.envelope = envelope;
         self.dropout_repair = Some((mask, output, kernel));
-        self.smoothing = Some(smoothing);
+        self.dropout_gpu = Some(gpu);
         Ok(())
     }
     /// Longest field envelope the GPU smooths: a PAL field plus margin.
@@ -810,52 +878,55 @@ impl Pipeline {
             envelope: range.map(|(start, _)| (start, env)),
         })
     }
-    /// Upload the field's lines and queue TBC rendering without waiting, so
-    /// the GPU renders while the host detects dropouts. Finish with
-    /// [`Self::finish_field`].
-    ///
-    /// With `envelope` (first sample, length), the GPU first smooths that
-    /// range of the dropout envelope; this returns once it is read back,
-    /// while rendering continues.
+    /// Upload the field's lines and queue TBC rendering without waiting.
+    /// With `dropouts` (first envelope sample, length, threshold fraction),
+    /// dropout detection is queued too. Finish with [`Self::finish_field`].
     pub(crate) fn begin_field(
         &self,
         locations: &[f64],
         locked: &[bool],
         blank: f32,
-        envelope: Option<(u64, usize)>,
+        dropouts: Option<(u64, usize, f32)>,
     ) -> Result<FieldUpload, String> {
         let run = || -> ocl::Result<FieldUpload> {
             let (origins, lines) = self.field_lines(locations, locked);
-            let mut upload = FieldUpload {
+            let upload = FieldUpload {
                 fence: UploadFence {
                     queue: self._pq.queue().clone(),
                     pending: true,
                 },
                 _origins: origins,
                 _lines: lines,
-                smoothed: Vec::new(),
+                dropouts: dropouts.map(|d| (d.1, d.2)),
             };
-            let mut smoothed = ocl::Event::empty();
-            if let (Some((start, count)), Some((forward, backward, _, out))) =
-                (envelope, &self.smoothing)
-            {
+            if let (Some((start, count, fraction)), Some(gpu)) = (dropouts, &self.dropout_gpu) {
                 if count > self.smoothing_capacity() || count == 0 {
                     return Err("Dropout envelope exceeds the smoothing buffer".into());
                 }
-                let items = count.div_ceil(256);
-                forward.set_arg(2, start as u32 & self.mask)?;
-                forward.set_arg(3, count as u32)?;
-                backward.set_arg(1, count as u32)?;
-                upload.smoothed = vec![0f32; count];
-                // The upload owns the vector until finish_field or its fence.
+                let chunks = count.div_ceil(DROPOUT_CHUNK);
+                gpu.forward.set_arg(2, start as u32 & self.mask)?;
+                gpu.forward.set_arg(3, count as u32)?;
+                gpu.backward.set_arg(1, count as u32)?;
+                gpu.median.set_arg(1, count as u32)?;
+                gpu.chunks.set_arg(1, count as u32)?;
+                gpu.chunks.set_arg(3, fraction)?;
+                gpu.entries.set_arg(1, chunks as u32)?;
+                gpu.events.set_arg(1, count as u32)?;
+                gpu.events.set_arg(3, fraction)?;
+                gpu.event_count.cmd().fill(0u32, None).enq()?;
                 unsafe {
-                    forward.cmd().global_work_size(items).enq()?;
-                    backward.cmd().global_work_size(items).enq()?;
-                    out.read(&mut upload.smoothed)
-                        .len(count)
-                        .block(false)
-                        .enew(&mut smoothed)
+                    gpu.forward
+                        .cmd()
+                        .global_work_size(count.div_ceil(256))
                         .enq()?;
+                    gpu.backward
+                        .cmd()
+                        .global_work_size(count.div_ceil(256))
+                        .enq()?;
+                    gpu.median.enq()?;
+                    gpu.chunks.cmd().global_work_size(chunks).enq()?;
+                    gpu.entries.enq()?;
+                    gpu.events.cmd().global_work_size(chunks).enq()?;
                 }
             }
             // The upload owns the host data until finish_field's blocking read.
@@ -866,37 +937,68 @@ impl Pipeline {
             self.tbc.set_arg(5, blank)?;
             self.render_kernels()?;
             self._pq.queue().flush()?;
-            if !upload.smoothed.is_empty() {
-                smoothed.wait_for()?;
-            }
             Ok(upload)
         };
         run().map_err(|e| e.to_string())
     }
-    /// Apply the dropout mask, if any, and read the field queued by
-    /// [`Self::begin_field`].
+    /// Read the field queued by [`Self::begin_field`] and, when requested, its
+    /// raw dropout intervals as [`crate::dropout::raw_intervals`] finds them.
+    /// Dropouts are not repaired in the returned field.
     pub(crate) fn finish_field(
         &self,
         mut upload: FieldUpload,
-        dropouts: Option<&crate::dropout::Map>,
-    ) -> Result<Vec<u16>, String> {
-        let run = || -> ocl::Result<Vec<u16>> {
-            if let (Some(map), Some((mask, _, _))) = (dropouts, &self.dropout_repair) {
-                // The map outlives the blocking read below.
-                unsafe {
-                    mask.write(&map.mask).block(false).enq()?;
-                }
-            }
-            if dropouts.is_some() {
-                self.correct_tbc()?;
-            }
+    ) -> Result<(Vec<u16>, Option<Intervals>), String> {
+        let run = || -> ocl::Result<(Vec<u16>, Option<Intervals>)> {
             let mut pixels = vec![0u16; WIDTH * HEIGHT * 2];
+            let (Some((count, fraction)), Some(gpu)) = (upload.dropouts, &self.dropout_gpu) else {
+                self.output.read(&mut pixels).enq()?;
+                return Ok((pixels, None));
+            };
+            let mut level = [0f32; 2];
+            let mut total = [0u32];
+            let mut events = vec![0u32; DROPOUT_EVENTS_READ];
+            // The host buffers outlive the blocking read that follows.
+            unsafe {
+                gpu.level.read(&mut level[..]).block(false).enq()?;
+                gpu.event_count.read(&mut total[..]).block(false).enq()?;
+                gpu.event_list.read(&mut events).block(false).enq()?;
+            }
             self.output.read(&mut pixels).enq()?;
-            Ok(pixels)
+            let total = total[0] as usize;
+            if level[1] < 32.0 {
+                return Ok((pixels, Some(Vec::new())));
+            }
+            if total > DROPOUT_EVENTS {
+                // Too many boundaries for the event list: detect on the host.
+                let mut smoothed = vec![0f32; count];
+                gpu.smoothed.read(&mut smoothed).len(count).enq()?;
+                return Ok((
+                    pixels,
+                    Some(crate::dropout::raw_intervals(&smoothed, fraction)),
+                ));
+            }
+            if total > DROPOUT_EVENTS_READ {
+                events.resize(total, 0);
+                gpu.event_list
+                    .read(&mut events[DROPOUT_EVENTS_READ..])
+                    .offset(DROPOUT_EVENTS_READ)
+                    .enq()?;
+            }
+            events.truncate(total);
+            Ok((
+                pixels,
+                Some(crate::dropout::event_intervals(&mut events, count)),
+            ))
         };
-        let pixels = run().map_err(|e| e.to_string())?;
+        let result = run().map_err(|e| e.to_string())?;
         upload.fence.pending = false;
-        Ok(pixels)
+        Ok(result)
+    }
+    /// Repair the resident field with a dropout mask, for the GPU colour
+    /// preview; the host repairs its own copy.
+    pub(crate) fn repair_resident(&self, map: &crate::dropout::Map) -> Result<(), String> {
+        self.set_dropout_mask(map)?;
+        self.correct_tbc().map_err(|e| e.to_string())
     }
     pub(crate) fn field(
         &mut self,
@@ -1151,6 +1253,53 @@ mod monitor_tests {
         let mut actual = vec![0; pixels.len()];
         pipeline.output.read(&mut actual).enq().unwrap();
         assert_eq!(actual, pixels, "CPU/OpenCL concealment must match exactly");
+    }
+    #[test]
+    #[ignore = "requires a working OpenCL GPU"]
+    fn gpu_dropout_intervals_match_cpu_across_ring_wrap() {
+        let fs = 315e6 / 11.0;
+        let mut pipeline = Pipeline::new(fs).unwrap();
+        pipeline.enable_dropouts().unwrap();
+        let base = (7u64 << 32) + pipeline.mask as u64 - 500;
+        let locations: Vec<f64> = (0..=HEIGHT)
+            .map(|r| base as f64 + r as f64 * fs * 64e-6)
+            .collect();
+        let count = (locations[HEIGHT].ceil() as u64 - base) as usize;
+        // Noisy RF level with dropouts of many lengths, some near chunk edges.
+        let mut seed = 7u32;
+        let mut env: Vec<f32> = (0..count)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                0.6 + (seed >> 8) as f32 / (1u32 << 24) as f32
+            })
+            .collect();
+        for (n, start) in (0..count - 2000).step_by(2999).enumerate() {
+            env[start..start + 5 + n % 400].fill(0.01);
+        }
+        env[count - 50..].fill(f32::NAN);
+        let at = (base as u32 & pipeline.mask) as usize;
+        let first = count.min(pipeline.capacity() - at);
+        pipeline
+            .envelope
+            .write(&env[..first])
+            .offset(at)
+            .enq()
+            .unwrap();
+        pipeline
+            .envelope
+            .write(&env[first..])
+            .offset(0)
+            .enq()
+            .unwrap();
+        let locked = vec![true; HEIGHT + 1];
+        let upload = pipeline
+            .begin_field(&locations, &locked, 4.1e6, Some((base, count, 0.35)))
+            .unwrap();
+        let (_, intervals) = pipeline.finish_field(upload).unwrap();
+        let expected =
+            crate::dropout::raw_intervals(&crate::dropout::smooth_envelope(&env, fs), 0.35);
+        assert!(expected.len() > 50, "{} intervals", expected.len());
+        assert_eq!(intervals.unwrap(), expected);
     }
     #[test]
     #[ignore = "requires a working OpenCL GPU"]

@@ -1059,6 +1059,15 @@ impl Output {
     }
     /// Send one preview packet without waiting; the GUI drops stale packets.
     /// A broken preview ends preview-only mode, but never a recording.
+    fn note_dropouts(&mut self, seq: usize, map: &crate::dropout::Map) {
+        if map.count() > 0 {
+            self.dropout_fields += 1;
+            println!(
+                "DROPOUTS field={seq} spans={} correction_enabled=true",
+                map.count()
+            );
+        }
+    }
     fn send_preview(&mut self, packet: &[u8]) -> Result<(), String> {
         let Some(socket) = &mut self.socket else {
             return Ok(());
@@ -1295,29 +1304,28 @@ impl Output {
         }
         let seq = self.count + 1;
         let mut queued = None;
-        let dropout_map = if self.dropouts {
+        let mut dropout_map = None;
+        if self.dropouts {
+            let start = locations[0].floor() as u64;
+            let end = locations[HEIGHT].ceil() as u64;
+            let count = (end - start) as usize;
             let map = if let Some(pipeline) = gpu.as_deref_mut() {
-                let start = locations[0].floor() as u64;
-                let end = locations[HEIGHT].ceil() as u64;
-                let count = (end - start) as usize;
                 let read = envelope
                     .as_ref()
                     .filter(|(at, env)| *at <= start && end <= at + env.len() as u64);
                 if !self.monitor && count <= pipeline.smoothing_capacity() {
-                    // While recording, the GPU smooths the envelope and renders
-                    // the field during detection; the mask is applied when the
-                    // field is read back.
-                    let upload =
-                        pipeline.begin_field(&locations, &locked, blank, Some((start, count)))?;
-                    let map = crate::dropout::detect_smoothed(
-                        upload.smoothed(),
+                    // While recording, the GPU detects dropouts along with the
+                    // field; the host maps and repairs them after the readback.
+                    queued = Some((
+                        pipeline.begin_field(
+                            &locations,
+                            &locked,
+                            blank,
+                            Some((start, count, self.dropout_threshold)),
+                        )?,
                         start,
-                        &locations,
-                        fs,
-                        self.dropout_threshold,
-                    );
-                    queued = Some(upload);
-                    map
+                    ));
+                    None
                 } else if let Some((at, env)) = read {
                     let map = crate::dropout::detect(
                         &env[(start - at) as usize..(end - at) as usize],
@@ -1327,35 +1335,27 @@ impl Output {
                         self.dropout_threshold,
                     );
                     pipeline.set_dropout_mask(&map)?;
-                    map
+                    Some(map)
                 } else {
                     let map = pipeline.dropout_map(&locations, self.dropout_threshold)?;
                     pipeline.set_dropout_mask(&map)?;
-                    map
+                    Some(map)
                 }
             } else {
-                let start = locations[0].floor() as u64;
                 let begin = (start - data.base) as usize;
-                let end = (locations[HEIGHT].ceil() as u64 - data.base) as usize;
-                crate::dropout::detect(
-                    &data.envelope[begin..end],
+                Some(crate::dropout::detect(
+                    &data.envelope[begin..begin + count],
                     start,
                     &locations,
                     fs,
                     self.dropout_threshold,
-                )
+                ))
             };
-            if map.count() > 0 {
-                self.dropout_fields += 1;
-                println!(
-                    "DROPOUTS field={seq} spans={} correction_enabled=true",
-                    map.count()
-                );
+            if let Some(map) = map {
+                self.note_dropouts(seq, &map);
+                dropout_map = Some(map);
             }
-            Some(map)
-        } else {
-            None
-        };
+        }
         if self.monitor {
             if let Some(server) = &mut self.vbi {
                 let samples = if let Some(pipeline) = gpu.as_deref_mut() {
@@ -1438,8 +1438,23 @@ impl Output {
             }
         }
         let mut pixels = if let Some(pipeline) = gpu.as_deref_mut() {
-            if let Some(upload) = queued.take() {
-                pipeline.finish_field(upload, dropout_map.as_ref())?
+            if let Some((upload, start)) = queued.take() {
+                let (mut pixels, intervals) = pipeline.finish_field(upload)?;
+                let map = crate::dropout::map_intervals(
+                    intervals.unwrap_or_default(),
+                    start,
+                    &locations,
+                    fs,
+                );
+                if map.count() > 0 {
+                    crate::dropout::repair(&mut pixels, &map);
+                    if self.colour_preview {
+                        pipeline.repair_resident(&map)?;
+                    }
+                }
+                self.note_dropouts(seq, &map);
+                dropout_map = Some(map);
+                pixels
             } else {
                 pipeline.field(&locations, &locked, blank)?
             }
