@@ -37,11 +37,27 @@ pub fn default_threshold(frequency_mhz: f64) -> f32 {
 
 /// Use RF amplitude, never picture brightness, to distinguish damage from whites.
 pub fn detect(envelope: &[f32], base: u64, locations: &[f64], fs: f64, fraction: f32) -> Map {
-    let mut map = Map::empty();
     // The discriminator's analytic amplitude contains short interference dips
     // on clean FM transitions. Detect loss on a 700 kHz zero-phase envelope,
     // rather than allowing those dips to become replacement picture samples.
-    let envelope = smooth_envelope(envelope, fs);
+    detect_smoothed(
+        &smooth_envelope(envelope, fs),
+        base,
+        locations,
+        fs,
+        fraction,
+    )
+}
+
+/// [`detect`] on an envelope already smoothed, e.g. on the GPU.
+pub fn detect_smoothed(
+    envelope: &[f32],
+    base: u64,
+    locations: &[f64],
+    fs: f64,
+    fraction: f32,
+) -> Map {
+    let mut map = Map::empty();
     let mut levels: Vec<f32> = envelope
         .iter()
         .step_by(32)
@@ -118,32 +134,36 @@ fn smooth_envelope(input: &[f32], fs: f64) -> Vec<f32> {
     if input.is_empty() {
         return Vec::new();
     }
-    // Bilinear first-order Butterworth, applied forward and backward. Both
-    // resident OpenCL and CPU decoding use this same detector on field data.
-    let k = (std::f64::consts::PI * 700_000.0 / fs).tan() as f32;
-    let b = k / (1.0 + k);
-    let a = (k - 1.0) / (k + 1.0);
+    let (b, a) = smoothing(fs);
     let clean: Vec<_> = input
         .iter()
         .map(|v| if v.is_finite() { v.max(0.0) } else { 0.0 })
         .collect();
-    let forward = smooth_pass(&clean, b, a, false);
-    smooth_pass(&forward, b, a, true)
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let chunk = clean.len().div_ceil(threads).max(4 * WARMUP);
+    let forward = smooth_pass(&clean, b, a, false, chunk);
+    smooth_pass(&forward, b, a, true, chunk)
+}
+
+/// Coefficients of the bilinear first-order 700 kHz Butterworth low-pass,
+/// applied forward and backward. The CPU and the OpenCL `smooth_*` kernels
+/// share this detector on field data.
+pub fn smoothing(fs: f64) -> (f32, f32) {
+    let k = (std::f64::consts::PI * 700_000.0 / fs).tan() as f32;
+    (k / (1.0 + k), (k - 1.0) / (k + 1.0))
 }
 
 /// Samples a chunk's filter state runs through before its first output. The
 /// pole is about -0.86 at 28.6 MHz, so an arbitrary start state decays below
 /// f32 precision long before this and the chunks join the serial result.
-const WARMUP: usize = 512;
+pub const WARMUP: usize = 512;
 
 /// One direction of the first-order filter, split into chunks filtered on all
 /// cores. A field envelope is over half a million samples, and the serial
 /// recursion otherwise dominates dropout detection.
-fn smooth_pass(x: &[f32], b: f32, a: f32, reverse: bool) -> Vec<f32> {
+fn smooth_pass(x: &[f32], b: f32, a: f32, reverse: bool, chunk: usize) -> Vec<f32> {
     let n = x.len();
     let mut y = vec![0.0; n];
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let chunk = n.div_ceil(threads).max(4 * WARMUP);
     let step = |state: &mut (f32, f32), current: f32| {
         let value = b * (current + state.0) - a * state.1;
         *state = (current, value);
@@ -303,8 +323,7 @@ mod tests {
                 }
             })
             .collect();
-        let k = (std::f64::consts::PI * 700_000.0 / fs).tan() as f32;
-        let (b, a) = (k / (1.0 + k), (k - 1.0) / (k + 1.0));
+        let (b, a) = smoothing(fs);
         let serial = |x: &[f32], reverse: bool| {
             let mut y = vec![0.0; x.len()];
             let order: Vec<usize> = if reverse {
@@ -321,5 +340,8 @@ mod tests {
         };
         let expected = serial(&serial(&input, false), true);
         assert_eq!(smooth_envelope(&input, fs), expected);
+        // The OpenCL kernels filter 256-sample chunks.
+        let gpu = smooth_pass(&smooth_pass(&input, b, a, false, 256), b, a, true, 256);
+        assert_eq!(gpu, expected);
     }
 }

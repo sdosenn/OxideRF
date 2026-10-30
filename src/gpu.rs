@@ -35,6 +35,13 @@ pub(crate) struct FieldUpload {
     fence: UploadFence,
     _origins: Vec<u32>,
     _lines: Vec<f32>,
+    smoothed: Vec<f32>,
+}
+impl FieldUpload {
+    /// The field's smoothed dropout envelope, when one was requested.
+    pub(crate) fn smoothed(&self) -> &[f32] {
+        &self.smoothed
+    }
 }
 
 pub(crate) struct Pipeline {
@@ -78,6 +85,8 @@ pub(crate) struct Pipeline {
     colour_preview: Option<crate::export::GpuPreview>,
     envelope: Buffer<f32>,
     dropout_repair: Option<(Buffer<u8>, Buffer<u16>, Kernel)>,
+    /// Forward/backward envelope smoothing kernels and their output buffers.
+    smoothing: Option<(Kernel, Kernel, Buffer<f32>, Buffer<f32>)>,
     // Keep all backing allocations alive for cached kernel arguments.
     _work: Vec<Buffer<f32>>,
 }
@@ -454,6 +463,7 @@ impl Pipeline {
             colour_preview: None,
             envelope,
             dropout_repair: None,
+            smoothing: None,
             _work: work,
         })
     }
@@ -476,12 +486,49 @@ impl Pipeline {
                 .build()?;
             self.store.set_arg(10, &envelope)?;
             self.store.set_arg(11, 1i32)?;
-            Ok::<_, ocl::Error>((envelope, mask, output, kernel))
+            let (b, a) = crate::dropout::smoothing(self.fs);
+            let length = self.smoothing_capacity();
+            let forward_out = buffer::<f32>(&self._pq, length)?;
+            let backward_out = buffer::<f32>(&self._pq, length)?;
+            let forward = self
+                ._pq
+                .kernel_builder("smooth_forward")
+                .global_work_size(1)
+                .arg(&envelope)
+                .arg(self.mask)
+                .arg(0u32)
+                .arg(0u32)
+                .arg(b)
+                .arg(a)
+                .arg(&forward_out)
+                .build()?;
+            let backward = self
+                ._pq
+                .kernel_builder("smooth_backward")
+                .global_work_size(1)
+                .arg(&forward_out)
+                .arg(0u32)
+                .arg(b)
+                .arg(a)
+                .arg(&backward_out)
+                .build()?;
+            Ok::<_, ocl::Error>((
+                envelope,
+                mask,
+                output,
+                kernel,
+                (forward, backward, forward_out, backward_out),
+            ))
         };
-        let (envelope, mask, output, kernel) = run().map_err(|e| e.to_string())?;
+        let (envelope, mask, output, kernel, smoothing) = run().map_err(|e| e.to_string())?;
         self.envelope = envelope;
         self.dropout_repair = Some((mask, output, kernel));
+        self.smoothing = Some(smoothing);
         Ok(())
+    }
+    /// Longest field envelope the GPU smooths: a PAL field plus margin.
+    pub(crate) fn smoothing_capacity(&self) -> usize {
+        (self.fs * 0.025) as usize
     }
     pub(crate) fn dropout_map(
         &self,
@@ -766,22 +813,51 @@ impl Pipeline {
     /// Upload the field's lines and queue TBC rendering without waiting, so
     /// the GPU renders while the host detects dropouts. Finish with
     /// [`Self::finish_field`].
+    ///
+    /// With `envelope` (first sample, length), the GPU first smooths that
+    /// range of the dropout envelope; this returns once it is read back,
+    /// while rendering continues.
     pub(crate) fn begin_field(
         &self,
         locations: &[f64],
         locked: &[bool],
         blank: f32,
+        envelope: Option<(u64, usize)>,
     ) -> Result<FieldUpload, String> {
         let run = || -> ocl::Result<FieldUpload> {
             let (origins, lines) = self.field_lines(locations, locked);
-            let upload = FieldUpload {
+            let mut upload = FieldUpload {
                 fence: UploadFence {
                     queue: self._pq.queue().clone(),
                     pending: true,
                 },
                 _origins: origins,
                 _lines: lines,
+                smoothed: Vec::new(),
             };
+            let mut smoothed = ocl::Event::empty();
+            if let (Some((start, count)), Some((forward, backward, _, out))) =
+                (envelope, &self.smoothing)
+            {
+                if count > self.smoothing_capacity() || count == 0 {
+                    return Err("Dropout envelope exceeds the smoothing buffer".into());
+                }
+                let items = count.div_ceil(256);
+                forward.set_arg(2, start as u32 & self.mask)?;
+                forward.set_arg(3, count as u32)?;
+                backward.set_arg(1, count as u32)?;
+                upload.smoothed = vec![0f32; count];
+                // The upload owns the vector until finish_field or its fence.
+                unsafe {
+                    forward.cmd().global_work_size(items).enq()?;
+                    backward.cmd().global_work_size(items).enq()?;
+                    out.read(&mut upload.smoothed)
+                        .len(count)
+                        .block(false)
+                        .enew(&mut smoothed)
+                        .enq()?;
+                }
+            }
             // The upload owns the host data until finish_field's blocking read.
             unsafe {
                 self.origins.write(&upload._origins).block(false).enq()?;
@@ -790,6 +866,9 @@ impl Pipeline {
             self.tbc.set_arg(5, blank)?;
             self.render_kernels()?;
             self._pq.queue().flush()?;
+            if !upload.smoothed.is_empty() {
+                smoothed.wait_for()?;
+            }
             Ok(upload)
         };
         run().map_err(|e| e.to_string())

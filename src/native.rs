@@ -1233,7 +1233,12 @@ impl Output {
         // On the GPU both refinements, and the dropout envelope, take one round trip.
         let mut envelope = None;
         if let Some(pipeline) = gpu.as_deref_mut() {
-            let refined = pipeline.refine_field(&mut locations, &mut locked, self.dropouts)?;
+            // While recording, the GPU smooths the dropout envelope itself.
+            let refined = pipeline.refine_field(
+                &mut locations,
+                &mut locked,
+                self.dropouts && self.monitor,
+            )?;
             for &(tip, porch) in refined.levels[22..300].iter().flatten() {
                 tips.push(tip);
                 porches.push(porch);
@@ -1294,15 +1299,26 @@ impl Output {
             let map = if let Some(pipeline) = gpu.as_deref_mut() {
                 let start = locations[0].floor() as u64;
                 let end = locations[HEIGHT].ceil() as u64;
+                let count = (end - start) as usize;
                 let read = envelope
                     .as_ref()
                     .filter(|(at, env)| *at <= start && end <= at + env.len() as u64);
-                if let Some((at, env)) = read {
-                    // While recording, the GPU renders the field during detection
-                    // and applies the mask when it is read back.
-                    if !self.monitor {
-                        queued = Some(pipeline.begin_field(&locations, &locked, blank)?);
-                    }
+                if !self.monitor && count <= pipeline.smoothing_capacity() {
+                    // While recording, the GPU smooths the envelope and renders
+                    // the field during detection; the mask is applied when the
+                    // field is read back.
+                    let upload =
+                        pipeline.begin_field(&locations, &locked, blank, Some((start, count)))?;
+                    let map = crate::dropout::detect_smoothed(
+                        upload.smoothed(),
+                        start,
+                        &locations,
+                        fs,
+                        self.dropout_threshold,
+                    );
+                    queued = Some(upload);
+                    map
+                } else if let Some((at, env)) = read {
                     let map = crate::dropout::detect(
                         &env[(start - at) as usize..(end - at) as usize],
                         start,
@@ -1310,9 +1326,7 @@ impl Output {
                         fs,
                         self.dropout_threshold,
                     );
-                    if queued.is_none() {
-                        pipeline.set_dropout_mask(&map)?;
-                    }
+                    pipeline.set_dropout_mask(&map)?;
                     map
                 } else {
                     let map = pipeline.dropout_map(&locations, self.dropout_threshold)?;

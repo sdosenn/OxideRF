@@ -226,6 +226,41 @@ __kernel void refine_lines_at(__global const float4 *ring, uint mask,
     float level=(threshold[0]+threshold[1])*0.5f;
     result[row]=refine_row(ring,mask,origins[row]+(uint)(int)whole,edge,samples_per_us,level);
 }
+// Chunked forward and backward passes of the dropout envelope low-pass, as
+// in dropout.rs: each work item filters 256 samples after a 512-sample
+// warm-up, which reproduces the serial filter. Contraction into FMA would
+// change rounding, so it stays off.
+#define SMOOTH_CHUNK 256u
+#define SMOOTH_WARMUP 512u
+float clean_envelope(float v) { return isfinite(v) ? fmax(v,0.0f) : 0.0f; }
+__kernel void smooth_forward(__global const float *envelope, uint mask, uint origin, uint count,
+                             float b, float a, __global float *out) {
+    #pragma OPENCL FP_CONTRACT OFF
+    uint begin=get_global_id(0)*SMOOTH_CHUNK;
+    if (begin>=count) return;
+    uint end=min(begin+SMOOTH_CHUNK,count), from=begin>SMOOTH_WARMUP ? begin-SMOOTH_WARMUP : 0u;
+    float previous_input=clean_envelope(envelope[(origin+from)&mask]), previous_output=previous_input;
+    for (uint k=from; k<end; ++k) {
+        float current=clean_envelope(envelope[(origin+k)&mask]);
+        float value=b*(current+previous_input)-a*previous_output;
+        previous_input=current; previous_output=value;
+        if (k>=begin) out[k]=value;
+    }
+}
+__kernel void smooth_backward(__global const float *in, uint count, float b, float a,
+                              __global float *out) {
+    #pragma OPENCL FP_CONTRACT OFF
+    uint begin=get_global_id(0)*SMOOTH_CHUNK;
+    if (begin>=count) return;
+    uint end=min(begin+SMOOTH_CHUNK,count), from=min(end+SMOOTH_WARMUP,count);
+    float previous_input=in[from-1], previous_output=previous_input;
+    for (uint k=from; k>begin; --k) {
+        float current=in[k-1];
+        float value=b*(current+previous_input)-a*previous_output;
+        previous_input=current; previous_output=value;
+        if (k-1<end) out[k-1]=value;
+    }
+}
 __kernel void burst_rows(__global const float4 *ring, uint mask,
                           __global const uint *origins, __global const float4 *lines,
                           __global float4 *burst) {
