@@ -25,8 +25,6 @@ impl Drop for UploadFence {
 pub(crate) struct RefinedField {
     /// First-pass tip and porch levels of each line still locked after it.
     pub levels: Vec<Option<(f32, f32)>>,
-    /// Absolute first sample and RF envelope covering the refined field.
-    pub envelope: Option<(u64, Vec<f32>)>,
 }
 
 /// Host line data borrowed by a field queued with [`Pipeline::begin_field`].
@@ -778,24 +776,21 @@ impl Pipeline {
             .map(|v| (v[1], v[2]))
             .collect())
     }
-    /// Both sync refinements and, for dropout detection, the field's RF
-    /// envelope in a single GPU round trip. The field threshold between the
-    /// passes is computed on the GPU. Returns the first pass's tip and porch
-    /// levels and, when requested, the envelope from `envelope.0`.
+    /// Both sync refinements in a single GPU round trip. The field threshold
+    /// between the passes is computed on the GPU. Returns the first pass's tip
+    /// and porch levels.
     pub(crate) fn refine_field(
         &mut self,
         locations: &mut [f64],
         locked: &mut [bool],
-        envelope: bool,
     ) -> Result<RefinedField, String> {
-        self.refine_field_inner(locations, locked, envelope)
+        self.refine_field_inner(locations, locked)
             .map_err(|e| e.to_string())
     }
     fn refine_field_inner(
         &mut self,
         locations: &mut [f64],
         locked: &mut [bool],
-        envelope: bool,
     ) -> ocl::Result<RefinedField> {
         self.refine.set_arg(6, 0.0f32)?;
         let origins: Vec<_> = locations
@@ -807,18 +802,9 @@ impl Pipeline {
             .zip(locked.iter())
             .flat_map(|(p, locked)| [p.fract() as f32, 0.0, if *locked { 1.0 } else { 0.0 }, 0.0])
             .collect();
-        // Refinement moves syncs by a few microseconds; a margin around the
-        // predicted field keeps the final envelope range inside this read.
-        let margin = (self.fs * 100e-6) as u64;
-        let range = envelope.then(|| {
-            let start = (locations[0].floor() as u64).saturating_sub(margin);
-            let count = (locations[HEIGHT].ceil() as u64 + margin - start) as usize;
-            (start, count.min(self.capacity()))
-        });
         let mut first = vec![0f32; locations.len() * 4];
         let mut second = vec![0f32; locations.len() * 4];
         let mut threshold = [0f32; 3];
-        let mut env = vec![0f32; range.map_or(0, |r| r.1)];
         let mut fence = UploadFence {
             queue: self._pq.queue().clone(),
             pending: true,
@@ -830,22 +816,6 @@ impl Pipeline {
             self.refine.enq()?;
             self.refine_threshold.enq()?;
             self.refine_at.enq()?;
-            if let Some((start, count)) = range {
-                let at = (start as u32 & self.mask) as usize;
-                let split = count.min(self.capacity() - at);
-                self.envelope
-                    .read(&mut env[..split])
-                    .offset(at)
-                    .block(false)
-                    .enq()?;
-                if split < count {
-                    self.envelope
-                        .read(&mut env[split..])
-                        .offset(0)
-                        .block(false)
-                        .enq()?;
-                }
-            }
             self.refined.read(&mut first).block(false).enq()?;
             self.threshold.read(&mut threshold[..]).block(false).enq()?;
         }
@@ -873,10 +843,7 @@ impl Pipeline {
         if threshold[2] > 100.0 {
             apply(locations, locked, &second);
         }
-        Ok(RefinedField {
-            levels,
-            envelope: range.map(|(start, _)| (start, env)),
-        })
+        Ok(RefinedField { levels })
     }
     /// Upload the field's lines and queue TBC rendering without waiting.
     /// With `dropouts` (first envelope sample, length, threshold fraction),
@@ -996,9 +963,31 @@ impl Pipeline {
     }
     /// Repair the resident field with a dropout mask, for the GPU colour
     /// preview; the host repairs its own copy.
-    pub(crate) fn repair_resident(&self, map: &crate::dropout::Map) -> Result<(), String> {
-        self.set_dropout_mask(map)?;
-        self.correct_tbc().map_err(|e| e.to_string())
+    /// Colour preview of the resident field after repairing it with `map`;
+    /// fields from [`Self::finish_field`] are read back unrepaired.
+    pub(crate) fn repaired_colour_pixels(
+        &self,
+        map: &crate::dropout::Map,
+    ) -> Result<Vec<u8>, String> {
+        let (mask, _, _) = self
+            .dropout_repair
+            .as_ref()
+            .ok_or("Dropout repair not configured")?;
+        let mut fence = UploadFence {
+            queue: self._pq.queue().clone(),
+            pending: true,
+        };
+        // The map outlives the blocking preview read, or the fence on error.
+        unsafe {
+            mask.write(&map.mask)
+                .block(false)
+                .enq()
+                .map_err(|e| e.to_string())?;
+        }
+        self.correct_tbc().map_err(|e| e.to_string())?;
+        let pixels = self.colour_pixels()?;
+        fence.pending = false;
+        Ok(pixels)
     }
     pub(crate) fn field(
         &mut self,

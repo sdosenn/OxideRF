@@ -1239,20 +1239,13 @@ impl Output {
             }
             locations.push(position);
         }
-        // On the GPU both refinements, and the dropout envelope, take one round trip.
-        let mut envelope = None;
+        // On the GPU both refinements take one round trip.
         if let Some(pipeline) = gpu.as_deref_mut() {
-            // While recording, the GPU smooths the dropout envelope itself.
-            let refined = pipeline.refine_field(
-                &mut locations,
-                &mut locked,
-                self.dropouts && self.monitor,
-            )?;
+            let refined = pipeline.refine_field(&mut locations, &mut locked)?;
             for &(tip, porch) in refined.levels[22..300].iter().flatten() {
                 tips.push(tip);
                 porches.push(porch);
             }
-            envelope = refined.envelope;
         }
         if gpu.is_none() && tips.len() > 100 && porches.len() > 100 {
             let threshold = (median(&mut tips) + median(&mut porches)) * 0.5;
@@ -1305,17 +1298,16 @@ impl Output {
         let seq = self.count + 1;
         let mut queued = None;
         let mut dropout_map = None;
+        // Set when the GPU's resident field still lacks dropout repair.
+        let mut resident_unrepaired = false;
         if self.dropouts {
             let start = locations[0].floor() as u64;
             let end = locations[HEIGHT].ceil() as u64;
             let count = (end - start) as usize;
             let map = if let Some(pipeline) = gpu.as_deref_mut() {
-                let read = envelope
-                    .as_ref()
-                    .filter(|(at, env)| *at <= start && end <= at + env.len() as u64);
-                if !self.monitor && count <= pipeline.smoothing_capacity() {
-                    // While recording, the GPU detects dropouts along with the
-                    // field; the host maps and repairs them after the readback.
+                if count <= pipeline.smoothing_capacity() {
+                    // The GPU detects dropouts along with the field; the host
+                    // maps and repairs them after the readback.
                     queued = Some((
                         pipeline.begin_field(
                             &locations,
@@ -1326,16 +1318,6 @@ impl Output {
                         start,
                     ));
                     None
-                } else if let Some((at, env)) = read {
-                    let map = crate::dropout::detect(
-                        &env[(start - at) as usize..(end - at) as usize],
-                        start,
-                        &locations,
-                        fs,
-                        self.dropout_threshold,
-                    );
-                    pipeline.set_dropout_mask(&map)?;
-                    Some(map)
                 } else {
                     let map = pipeline.dropout_map(&locations, self.dropout_threshold)?;
                     pipeline.set_dropout_mask(&map)?;
@@ -1448,9 +1430,7 @@ impl Output {
                 );
                 if map.count() > 0 {
                     crate::dropout::repair(&mut pixels, &map);
-                    if self.colour_preview {
-                        pipeline.repair_resident(&map)?;
-                    }
+                    resident_unrepaired = true;
                 }
                 self.note_dropouts(seq, &map);
                 dropout_map = Some(map);
@@ -1554,7 +1534,10 @@ impl Output {
         if self.colour_preview && colour_due {
             let updated = self.preview_updated;
             let colour = if let Some(pipeline) = gpu {
-                pipeline.colour_pixels()?
+                match dropout_map.as_ref().filter(|_| resident_unrepaired) {
+                    Some(map) => pipeline.repaired_colour_pixels(map)?,
+                    None => pipeline.colour_pixels()?,
+                }
             } else {
                 let cpu = self
                     .colour_cpu
