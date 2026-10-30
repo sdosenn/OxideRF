@@ -233,6 +233,68 @@ impl LiveCounters {
     }
 }
 
+/// RF samples in their capture format. The OpenCL backend uploads integer
+/// captures as they are and scales them on the GPU.
+pub(crate) enum Rf {
+    F32(Vec<f32>),
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+}
+impl Rf {
+    fn len(&self) -> usize {
+        match self {
+            Self::F32(v) => v.len(),
+            Self::U8(v) => v.len(),
+            Self::U16(v) => v.len(),
+        }
+    }
+    fn drain(&mut self, count: usize) {
+        match self {
+            Self::F32(v) => drop(v.drain(..count)),
+            Self::U8(v) => drop(v.drain(..count)),
+            Self::U16(v) => drop(v.drain(..count)),
+        }
+    }
+    fn extend(&mut self, more: Self) -> Result<(), String> {
+        match (self, more) {
+            (Self::F32(v), Self::F32(more)) => v.extend(more),
+            (Self::U8(v), Self::U8(more)) => v.extend(more),
+            (Self::U16(v), Self::U16(more)) => v.extend(more),
+            _ => return Err("RF sample format changed during capture".into()),
+        }
+        Ok(())
+    }
+    fn is_finite(&self) -> bool {
+        match self {
+            Self::F32(v) => v.iter().all(|x| x.is_finite()),
+            _ => true,
+        }
+    }
+    fn as_f32(&self) -> Result<&[f32], String> {
+        match self {
+            Self::F32(v) => Ok(v),
+            _ => Err("The CPU backend needs RF converted to f32".into()),
+        }
+    }
+}
+
+/// Up to `count` whole samples of `bytes` each; fewer only at end of file.
+fn read_pcm(reader: &mut BufReader<File>, count: usize, bytes: usize) -> Result<Vec<u8>, String> {
+    let mut data = vec![0u8; count * bytes];
+    let mut len = 0;
+    while len < data.len() {
+        let n = reader.read(&mut data[len..]).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        len += n;
+    }
+    if len % bytes != 0 {
+        return Err("Incomplete PCM sample at end of file".into());
+    }
+    data.truncate(len);
+    Ok(data)
+}
 enum Source {
     Live(crate::cxadc::Stream),
     Pcm {
@@ -305,19 +367,8 @@ impl Source {
                 kind,
                 bytes,
             } => {
-                let mut data = vec![0u8; count * *bytes];
-                let mut len = 0;
-                while len < data.len() {
-                    let n = reader.read(&mut data[len..]).map_err(|e| e.to_string())?;
-                    if n == 0 {
-                        break;
-                    }
-                    len += n;
-                }
-                if len % *bytes != 0 {
-                    return Err("Incomplete PCM sample at end of file".into());
-                }
-                Ok(data[..len]
+                let data = read_pcm(reader, count, *bytes)?;
+                Ok(data
                     .chunks_exact(*bytes)
                     .map(|b| match kind.as_str() {
                         "u8" => (b[0] as f32 - 128.0) / 128.0,
@@ -363,6 +414,34 @@ impl Source {
                 }
             }
         }
+    }
+    /// Like [`Self::read`], but u8 and u16 captures stay integers.
+    fn read_rf(&mut self, count: usize) -> Result<Rf, String> {
+        let raw = match self {
+            Self::Live(stream) => stream.read_raw(count)?,
+            Self::Pcm {
+                reader,
+                kind,
+                bytes,
+            } if kind == "u8" || kind == "u16" => read_pcm(reader, count, *bytes)?,
+            _ => return Ok(Rf::F32(self.read(count)?)),
+        };
+        let bytes = match self {
+            Self::Live(stream) => stream.bytes_per_sample(),
+            Self::Pcm { bytes, .. } => *bytes,
+            _ => unreachable!("only integer captures are read raw"),
+        };
+        Ok(if bytes == 1 {
+            Rf::U8(raw)
+        } else {
+            Rf::U16(
+                raw.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| u16::from_le_bytes(*b))
+                    .collect(),
+            )
+        })
     }
     fn skip(&mut self, samples: u64) -> Result<(), String> {
         if samples == 0 {
@@ -2124,7 +2203,7 @@ pub fn decode(args: &[String]) -> Result<(), String> {
     } else {
         cpu_blocks * HOP + 2 * EDGE
     };
-    let mut raw = Vec::new();
+    let mut raw = Rf::F32(Vec::new());
     let mut absolute = 0;
     let mut data = Samples {
         luma: Vec::new(),
@@ -2138,9 +2217,16 @@ pub fn decode(args: &[String]) -> Result<(), String> {
     let mut processed = 0usize;
     let mut rate_report = (std::time::Instant::now(), 0usize, std::time::Duration::ZERO);
     let result = (|| -> Result<(), String> {
-        raw = source.read(batch_samples)?;
+        let read = |source: &mut Source, count| {
+            if gpu {
+                source.read_rf(count)
+            } else {
+                source.read(count).map(Rf::F32)
+            }
+        };
+        raw = read(&mut source, batch_samples)?;
         while raw.len() >= N && !STOP.load(Ordering::Relaxed) {
-            if raw.iter().any(|x| !x.is_finite()) {
+            if !raw.is_finite() {
                 return Err("RF contains NaN/Inf samples".into());
             }
             let demod_started = std::time::Instant::now();
@@ -2150,12 +2236,13 @@ pub fn decode(args: &[String]) -> Result<(), String> {
                 if data.len() + consumed > pipeline.capacity() {
                     return Err("OpenCL signal ring would overwrite an undecoded field".into());
                 }
-                for (start, length) in pipeline.demod(&raw[..consumed + 2 * EDGE], absolute)? {
+                for (start, length) in pipeline.demod_rf(&raw, consumed + 2 * EDGE, absolute)? {
                     pulses.pulse(start, length, fs);
                 }
                 *data.resident_len.as_mut().unwrap() += consumed;
             } else {
                 let luma_only = monitor && !colour_preview;
+                let raw = raw.as_f32()?;
                 let decoded: Vec<_> = std::thread::scope(|scope| {
                     let workers: Vec<_> = (0..blocks)
                         .map(|block| {
@@ -2243,9 +2330,9 @@ pub fn decode(args: &[String]) -> Result<(), String> {
                 pulses.vertical.retain(|&p| p >= data.base);
                 processed = 0;
             }
-            raw.drain(..consumed);
+            raw.drain(consumed);
             let waiting = std::time::Instant::now();
-            raw.extend(source.read(batch_samples - raw.len())?);
+            raw.extend(read(&mut source, batch_samples - raw.len())?)?;
             counters.input_wait += waiting.elapsed();
             absolute += consumed as u64;
             if let Some(stats) = &mut live_stats {
@@ -2749,6 +2836,47 @@ mod tests {
                         .map(|p| (p[1] - p[0]) as f32 / fs as f32 * 1e6)
                         .collect::<Vec<_>>()
                 )
+            );
+        }
+    }
+    #[test]
+    #[ignore = "requires a working OpenCL GPU"]
+    fn gpu_integer_rf_matches_the_same_samples_as_f32() {
+        let fs = 315e6 / 11.0;
+        let len = N + 2 * HOP;
+        let wave = |i: usize| {
+            let t = i as f64 / fs;
+            (std::f64::consts::TAU * 4.2e6 * t + 0.2 * (std::f64::consts::TAU * 1e5 * t).sin())
+                .cos()
+        };
+        let u8s: Vec<u8> = (0..len).map(|i| (128.0 + 100.0 * wave(i)) as u8).collect();
+        let u16s: Vec<u16> = (0..len)
+            .map(|i| (32768.0 + 25000.0 * wave(i)) as u16)
+            .collect();
+        let cases = [
+            (
+                Rf::F32(u8s.iter().map(|&v| (v as f32 - 128.0) / 128.0).collect()),
+                Rf::U8(u8s),
+            ),
+            (
+                Rf::F32(
+                    u16s.iter()
+                        .map(|&v| (v as f32 - 32768.0) / 32768.0)
+                        .collect(),
+                ),
+                Rf::U16(u16s),
+            ),
+        ];
+        for (float, integer) in cases {
+            let mut signals = Vec::new();
+            for rf in [&float, &integer] {
+                let mut pipeline = crate::gpu::Pipeline::new(fs).unwrap();
+                let pulses = pipeline.demod_rf(rf, len, 0).unwrap();
+                signals.push((pulses, pipeline.read_signal(EDGE as u64, 3 * HOP)));
+            }
+            assert!(
+                signals[0] == signals[1],
+                "integer RF must decode bit-identically"
             );
         }
     }

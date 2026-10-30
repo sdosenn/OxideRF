@@ -8,11 +8,30 @@
 float2 cmul(float2 a, float2 b) {
     return (float2)(a.x*b.x-a.y*b.y, a.x*b.y+a.y*b.x);
 }
-__kernel void pack_rf(__global const float *raw, __global const float *means,
-                       __global float2 *dst) {
-    uint i = get_global_id(0), b = get_global_id(1);
-    dst[b*RF_N+i] = (float2)(raw[b*RF_HOP+i]-means[b], 0.0f);
+// RF arrives in its capture format and is scaled here exactly as on the CPU:
+// the scales are powers of two. One work-group per block sums its mean.
+#define RF_INPUT(NAME, T, OFFSET, SCALE) \
+__kernel void block_means_##NAME(__global const T *raw, __global float *means, \
+                                 __local float *sums) { \
+    uint lid = get_local_id(0), size = get_local_size(0), b = get_group_id(0); \
+    float sum = 0.0f; \
+    for (uint i = lid; i < RF_N; i += size) sum += ((float)raw[b*RF_HOP+i]-OFFSET)*SCALE; \
+    sums[lid] = sum; \
+    barrier(CLK_LOCAL_MEM_FENCE); \
+    for (uint stride = size/2; stride > 0; stride >>= 1) { \
+        if (lid < stride) sums[lid] += sums[lid+stride]; \
+        barrier(CLK_LOCAL_MEM_FENCE); \
+    } \
+    if (lid == 0) means[b] = sums[0]/RF_N; \
+} \
+__kernel void pack_rf_##NAME(__global const T *raw, __global const float *means, \
+                             __global float2 *dst) { \
+    uint i = get_global_id(0), b = get_global_id(1); \
+    dst[b*RF_N+i] = (float2)(((float)raw[b*RF_HOP+i]-OFFSET)*SCALE-means[b], 0.0f); \
 }
+RF_INPUT(f32, float, 0.0f, 1.0f)
+RF_INPUT(u8, uchar, 128.0f, (1.0f/128.0f))
+RF_INPUT(u16, ushort, 32768.0f, (1.0f/32768.0f))
 __kernel void rf_bands(__global const float2 *spectrum, __global const float *rf_gain,
                         __global const float *chroma_gain, __global float2 *analytic,
                         __global float2 *chroma, int luma_only) {
@@ -383,18 +402,32 @@ __kernel void burst_rows(__global const float4 *ring, uint mask,
 }
 // PAL VHS alternates unrotated and -90-degree/line recording heads. Infer
 // the head from the two-line burst correlation, then recover V-switch parity.
-__kernel void pal_chroma_state(__global const float4 *burst,__global int *state) {
-    float track=0.0f,polarity=0.0f;
-    for(uint row=18;row<TBC_HEIGHT-10;++row)
+// One work-group of 256 sums the track and both polarity candidates, so the
+// field does not wait on a single work item.
+__kernel void pal_chroma_state(__global const float4 *burst,__global int *state,
+                               __local float *sums) {
+    uint lid=get_local_id(0), size=get_local_size(0);
+    float track=0.0f,rotated=0.0f,unrotated=0.0f;
+    for(uint row=18+lid;row<TBC_HEIGHT-10;row+=size) {
         if(burst[row].z>0.0f && burst[row-2].z>0.0f)
             track+=cos(burst[row].w-burst[row-2].w);
-    for(uint row=18;row<TBC_HEIGHT-10;++row) {
         if(burst[row].z>0.0f && burst[row-1].z>0.0f) {
-            float delta=burst[row].w-burst[row-1].w;
-            polarity+=((row&1u)?-1.0f:1.0f)*(track<0.0f?cos(delta):sin(delta));
+            float delta=burst[row].w-burst[row-1].w, sign=(row&1u)?-1.0f:1.0f;
+            rotated+=sign*cos(delta);
+            unrotated+=sign*sin(delta);
         }
     }
-    state[0]=polarity<0.0f;
+    sums[lid]=track; sums[size+lid]=rotated; sums[2*size+lid]=unrotated;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for(uint stride=size/2;stride>0;stride>>=1) {
+        if(lid<stride) {
+            sums[lid]+=sums[lid+stride];
+            sums[size+lid]+=sums[size+lid+stride];
+            sums[2*size+lid]+=sums[2*size+lid+stride];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if(lid==0) state[0]=(sums[0]<0.0f ? sums[size] : sums[2*size])<0.0f;
 }
 void sort_gain512(__local float *values) {
     for(uint size=2;size<=512;size<<=1) for(uint stride=size>>1;stride>0;stride>>=1) {

@@ -1,6 +1,6 @@
 //! Batched OpenCL demodulation and TBC with a persistent device-side signal ring.
 use crate::native::{
-    lowpass, pal_rf_gain, pal_sync_gain, pal_video_gain, C, EDGE, HEIGHT, HOP, N, UNDER, WIDTH,
+    lowpass, pal_rf_gain, pal_sync_gain, pal_video_gain, Rf, C, EDGE, HEIGHT, HOP, N, UNDER, WIDTH,
 };
 use ocl::{Buffer, Kernel, ProQue};
 
@@ -70,8 +70,7 @@ pub(crate) struct Pipeline {
     batch: usize,
     ring: Buffer<f32>,
     sinc_lut: Buffer<f32>,
-    raw: Buffer<f32>,
-    means: Buffer<f32>,
+    raw: RfBuffers,
     phases: Buffer<f32>,
     count: Buffer<u32>,
     histogram: Buffer<u32>,
@@ -86,7 +85,6 @@ pub(crate) struct Pipeline {
     refined_at: Buffer<f32>,
     threshold: Buffer<f32>,
     output: Buffer<u16>,
-    pack: Kernel,
     demod: Vec<(Kernel, usize)>,
     store: Kernel,
     pulses: Kernel,
@@ -110,6 +108,75 @@ pub(crate) struct Pipeline {
     _work: Vec<Buffer<f32>>,
 }
 
+/// RF upload buffers and kernels for each capture sample format.
+struct RfBuffers {
+    f32: (Buffer<f32>, Kernel, Kernel),
+    u8: (Buffer<u8>, Kernel, Kernel),
+    u16: (Buffer<u16>, Kernel, Kernel),
+    _means: Buffer<f32>,
+}
+impl RfBuffers {
+    fn new(
+        pq: &ProQue,
+        len: usize,
+        means: &Buffer<f32>,
+        packed: &Buffer<f32>,
+    ) -> ocl::Result<Self> {
+        fn input<T: ocl::OclPrm>(
+            pq: &ProQue,
+            name: &str,
+            len: usize,
+            means: &Buffer<f32>,
+            packed: &Buffer<f32>,
+        ) -> ocl::Result<(Buffer<T>, Kernel, Kernel)> {
+            let raw = buffer::<T>(pq, len)?;
+            let block_means = pq
+                .kernel_builder(format!("block_means_{name}"))
+                .global_work_size(256)
+                .local_work_size(256)
+                .arg(&raw)
+                .arg(means)
+                .arg_local::<f32>(256)
+                .build()?;
+            let pack = pq
+                .kernel_builder(format!("pack_rf_{name}"))
+                .global_work_size([N, 1])
+                .arg(&raw)
+                .arg(means)
+                .arg(packed)
+                .build()?;
+            Ok((raw, block_means, pack))
+        }
+        Ok(Self {
+            f32: input(pq, "f32", len, means, packed)?,
+            u8: input(pq, "u8", len, means, packed)?,
+            u16: input(pq, "u16", len, means, packed)?,
+            _means: means.clone(),
+        })
+    }
+    /// Queue a non-blocking upload of the first `len` samples; returns the
+    /// mean and pack kernels for that format.
+    ///
+    /// # Safety
+    /// `raw` must outlive the upload, e.g. until a later blocking read.
+    unsafe fn upload(&self, raw: &Rf, len: usize) -> ocl::Result<(&Kernel, &Kernel)> {
+        let (means, pack) = match raw {
+            Rf::F32(v) => {
+                self.f32.0.write(&v[..len]).block(false).enq()?;
+                (&self.f32.1, &self.f32.2)
+            }
+            Rf::U8(v) => {
+                self.u8.0.write(&v[..len]).block(false).enq()?;
+                (&self.u8.1, &self.u8.2)
+            }
+            Rf::U16(v) => {
+                self.u16.0.write(&v[..len]).block(false).enq()?;
+                (&self.u16.1, &self.u16.2)
+            }
+        };
+        Ok((means, pack))
+    }
+}
 fn buffer<T: ocl::OclPrm>(pq: &ProQue, len: usize) -> ocl::Result<Buffer<T>> {
     Buffer::builder().queue(pq.queue().clone()).len(len).build()
 }
@@ -180,8 +247,8 @@ impl Pipeline {
         let capacity = ((fs * 0.075) as usize + batch * HOP + N).next_power_of_two();
         let mask = (capacity - 1) as u32;
         let ring = buffer::<f32>(&pq, capacity * 4)?;
-        let raw = buffer(&pq, N + (batch - 1) * HOP)?;
-        let means = buffer(&pq, batch)?;
+        let raw_len = N + (batch - 1) * HOP;
+        let means = buffer::<f32>(&pq, batch)?;
         let phases = buffer(&pq, batch * 2)?;
         let event_capacity = (batch * HOP) / (fs * 3e-6).floor().max(1.0) as usize + 32;
         let count = buffer(&pq, 1)?;
@@ -243,13 +310,7 @@ impl Pipeline {
                 },
             )?);
         }
-        let pack = pq
-            .kernel_builder("pack_rf")
-            .global_work_size([N, batch])
-            .arg(&raw)
-            .arg(&means)
-            .arg(&work[0])
-            .build()?;
+        let raw = RfBuffers::new(&pq, raw_len, &means, &work[0])?;
         let mut demod = fft(&pq, &work[0], &work[1], &tw, 0, batch)?;
         demod.push((
             pq.kernel_builder("rf_bands")
@@ -376,9 +437,11 @@ impl Pipeline {
         let pal_state = buffer::<i32>(&pq, 1)?;
         let chroma_state = pq
             .kernel_builder("pal_chroma_state")
-            .global_work_size(1)
+            .global_work_size(256)
+            .local_work_size(256)
             .arg(&row_burst)
             .arg(&pal_state)
+            .arg_local::<f32>(3 * 256)
             .build()?;
         let gain_cap = buffer::<f32>(&pq, 1)?;
         let smoothed_gain = buffer::<f32>(&pq, HEIGHT)?;
@@ -450,7 +513,6 @@ impl Pipeline {
             ring,
             sinc_lut,
             raw,
-            means,
             phases,
             count,
             histogram,
@@ -465,7 +527,6 @@ impl Pipeline {
             refined_at,
             threshold,
             output,
-            pack,
             demod,
             store,
             pulses,
@@ -654,15 +715,24 @@ impl Pipeline {
     pub(crate) fn batch_samples(&self) -> usize {
         self.batch * HOP + 2 * EDGE
     }
+    #[cfg(test)]
     pub(crate) fn demod(&mut self, raw: &[f32], absolute: u64) -> Result<Vec<(u64, u64)>, String> {
-        self.demod_inner(raw, absolute).map_err(|e| e.to_string())
+        self.demod_rf(&Rf::F32(raw.to_vec()), raw.len(), absolute)
     }
-    fn demod_inner(&mut self, raw: &[f32], absolute: u64) -> ocl::Result<Vec<(u64, u64)>> {
-        let blocks = (raw.len() - 2 * EDGE) / HOP;
-        let mut means = Vec::with_capacity(blocks);
+    /// Demodulate the first `len` samples of `raw`, in its capture format.
+    pub(crate) fn demod_rf(
+        &mut self,
+        raw: &Rf,
+        len: usize,
+        absolute: u64,
+    ) -> Result<Vec<(u64, u64)>, String> {
+        self.demod_inner(raw, len, absolute)
+            .map_err(|e| e.to_string())
+    }
+    fn demod_inner(&mut self, raw: &Rf, len: usize, absolute: u64) -> ocl::Result<Vec<(u64, u64)>> {
+        let blocks = (len - 2 * EDGE) / HOP;
         let mut phases = Vec::with_capacity(blocks * 2);
         for b in 0..blocks {
-            means.push(raw[b * HOP..b * HOP + N].iter().sum::<f32>() / N as f32);
             let phase = C::polar(
                 (-std::f64::consts::TAU * UNDER * (absolute + b as u64 * HOP as u64) as f64
                     / self.fs)
@@ -678,9 +748,8 @@ impl Pipeline {
         };
         // All borrowed inputs outlive the completion reads and UploadFence.
         // Avoid five GPU/CPU round trips before each small live RF batch.
+        let (means, pack) = unsafe { self.raw.upload(raw, len)? };
         unsafe {
-            self.raw.write(raw).block(false).enq()?;
-            self.means.write(&means).block(false).enq()?;
             self.phases.write(&phases).block(false).enq()?;
             self.count.write(&zero[..]).block(false).enq()?;
             self.histogram.write(&histogram[..]).block(false).enq()?;
@@ -691,7 +760,8 @@ impl Pipeline {
         self.pulses.set_arg(2, absolute + EDGE as u64)?;
         // Sizes and kernel arguments are validated here; all work uses one in-order queue.
         unsafe {
-            self.pack.cmd().global_work_size([N, blocks]).enq()?;
+            means.cmd().global_work_size(256 * blocks).enq()?;
+            pack.cmd().global_work_size([N, blocks]).enq()?;
             for (kernel, width) in &self.demod {
                 kernel.cmd().global_work_size([*width, blocks]).enq()?;
             }
