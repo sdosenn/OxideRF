@@ -166,8 +166,10 @@ impl Pipeline {
         Self::build(fs, false, true).map_err(|e| e.to_string())
     }
     fn build(fs: f64, luma_only: bool, monitor: bool) -> ocl::Result<Self> {
+        // Previews use smaller batches for lower latency; below 32 the per-batch
+        // overhead keeps an Apple M1 under real time with dropout correction.
         let batch = std::env::var("VHS_GPU_BATCH")
-            .unwrap_or_else(|_| if monitor { "16" } else { "64" }.into())
+            .unwrap_or_else(|_| if monitor { "32" } else { "64" }.into())
             .parse::<usize>()
             .map_err(|_| ocl::Error::from("VHS_GPU_BATCH must be an integer in 1..=64"))?;
         if !(1..=MAX_BATCH).contains(&batch) {

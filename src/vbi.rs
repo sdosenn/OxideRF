@@ -247,7 +247,10 @@ mod tests {
         let client = TcpStream::connect(server.listener.local_addr().unwrap()).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while server.client.is_none() {
-            assert!(std::time::Instant::now() < deadline, "client was not accepted");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "client was not accepted"
+            );
             server.accept().unwrap();
             thread::sleep(Duration::from_millis(1));
         }
